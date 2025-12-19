@@ -5,20 +5,12 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
-import json
-import math
-import random
-import contextlib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-# Ensure each rank initializes CUDA on its own device (avoids every process creating a context on cuda:0).
-if torch.cuda.is_available():
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -27,46 +19,6 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from model.attn_bias import SpectralBias
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-
-# Optionally prevent torch.compile from capturing FlexAttention (useful when Inductor hits a FlexAttention lowering bug).
-try:
-    import torch._dynamo as _dynamo  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    _dynamo = None  # type: ignore[assignment]
-
-def _flex_attention_eager(q, k, v, *, block_mask, score_mod=None, scale=None):
-    return flex_attention(q, k, v, block_mask=block_mask, score_mod=score_mod, scale=scale)
-
-@lru_cache(maxsize=None)
-def _get_compiled_flex_attention(backend: str, mode: str | None, fullgraph: bool):
-    # Compile FlexAttention as a standalone callable so graph-breaking around it
-    # does not fall back to the unfused reference path (which materializes full
-    # score matrices and is extremely slow/memory-heavy).
-    return torch.compile(
-        _flex_attention_eager,
-        dynamic=False,
-        backend=backend,
-        mode=mode,
-        fullgraph=fullgraph,
-    )
-
-def _flex_attention_call(q, k, v, *, block_mask, score_mod=None, scale=None):
-    # NOTE: this function is typically executed under `_dynamo.disable` when
-    # `FLEXATTN_DYNAMO_DISABLE=1`, so we do not assume any outer compilation.
-    # If enabled, we run a separately-compiled FlexAttention to retain the
-    # fused kernel (and avoid dense score materialization).
-    use_compile = bool(globals().get("args", None) is not None and getattr(args, "flexattn_compile", True))
-    if use_compile and hasattr(torch, "compile"):
-        backend = str(getattr(args, "torch_compile_backend", "inductor"))
-        mode = str(getattr(args, "torch_compile_mode", "default")).strip()
-        if mode.lower() in {"", "none"}:
-            mode = None  # type: ignore[assignment]
-        return _get_compiled_flex_attention(backend, mode, False)(
-            q, k, v, block_mask=block_mask, score_mod=score_mod, scale=scale
-        )
-    return _flex_attention_eager(q, k, v, block_mask=block_mask, score_mod=score_mod, scale=scale)
-
-flex_attention_nocompile = _dynamo.disable(_flex_attention_call) if _dynamo is not None else _flex_attention_call
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -130,11 +82,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    # Match the real kernel's layout: grad_w is returned as a transposed view
-    # with strides (1, out_features), not contiguous (in_features, 1).
-    grad_x = x_f8.to(torch.bfloat16)
-    grad_w = w_f8.to(torch.float32).T.contiguous().T
-    return grad_x, grad_w
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
 
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
@@ -334,7 +282,6 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, docs: Tensor) -> tuple[Tensor, Tensor]:
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        fa = flex_attention_nocompile if getattr(args, "flexattn_dynamo_disable", False) else flex_attention
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q_for_bias = q.transpose(1, 2)  # [B,H,T,D] before rotary
@@ -352,122 +299,60 @@ class CausalSelfAttention(nn.Module):
                 b0,
                 delta_star,
                 _pi,
-                budget_logits,
                 delta_main,
                 width,
                 cos_wD,
                 sin_wD,
                 reg_loss,
-            ) = self.spectral_bias(q_for_bias, docs=docs)
+            ) = self.spectral_bias(q_for_bias)
             beta = float(self.spectral_bias.beta)
             use_slope = bool(self.spectral_bias.use_slope)
             subtract_b0 = bool(self.spectral_bias.subtract_b0)
             gate_kind = self.spectral_bias.gate_kind
             ramp_lambda = float(self.spectral_bias.ramp_lambda)
             tau = float(self.spectral_bias.tau)
-            K = int(self.spectral_bias.K)
 
             if self.spectral_bias.use_pointer_mask:
                 block_mask = self.spectral_bias.build_pointer_blockmask(
                     docs=docs,
                     delta_star=delta_star,
-                    pi=_pi,
-                    budget_logits=budget_logits,
                     block_size=128,
                 )
 
-            spectral_impl = str(getattr(args, "spectral_impl", "score_mod")).strip().lower()
-            if spectral_impl == "qk_aug":
-                # Implement beta * b_q(i-j) by augmenting Q/K with position-dependent features, avoiding score_mod.
-                # b_q(Δ)=Σ_k A_k(q)cos(ω_kΔ)+B_k(q)sin(ω_kΔ) can be rewritten using cos(a-b), sin(a-b) identities.
-                s = math.sqrt(beta / float(self.attn_scale))
-                # cos/sin tables are [K,T]; transpose to [T,K] for broadcasting.
-                cos_t = cos_wD.transpose(0, 1).to(dtype=torch.float32)  # [T,K]
-                sin_t = sin_wD.transpose(0, 1).to(dtype=torch.float32)  # [T,K]
-                cos_bhtk = cos_t[None, None].expand(B, self.num_heads, T, K)
-                sin_bhtk = sin_t[None, None].expand(B, self.num_heads, T, K)
-
-                Qcos = coeff_cos * cos_bhtk + coeff_sin * sin_bhtk  # [B,H,T,K]
-                Qsin = coeff_cos * sin_bhtk - coeff_sin * cos_bhtk  # [B,H,T,K]
-                q_pos = torch.cat([Qcos, Qsin], dim=-1)  # [B,H,T,2K]
-                k_pos = torch.cat([cos_bhtk, sin_bhtk], dim=-1)  # [B,H,T,2K]
-
+            def score_mod(score, b, h, q_idx, kv_idx):
+                q_idx_l = q_idx.to(torch.long)
+                kv_idx_l = kv_idx.to(torch.long)
+                delta = (q_idx_l[:, None] - kv_idx_l[None, :]).clamp(min=0, max=T - 1)
+                cos = cos_wD[:, delta].permute(1, 2, 0)
+                sin = sin_wD[:, delta].permute(1, 2, 0)
+                A = coeff_cos[b, h, q_idx_l]
+                Bc = coeff_sin[b, h, q_idx_l]
+                bias = (A[:, None, :] * cos).sum(dim=-1) + (Bc[:, None, :] * sin).sum(dim=-1)
+                if subtract_b0:
+                    bias = bias - b0[b, h, q_idx_l][:, None]
                 if use_slope:
-                    # slope*(i-j) differs from -slope*j by a per-row constant (slope*i), which is softmax-invariant.
-                    pos = torch.arange(T, device=x.device, dtype=torch.float32)
-                    q_pos = torch.cat([q_pos, (-slope).unsqueeze(-1)], dim=-1)
-                    k_pos = torch.cat([k_pos, pos[None, None, :, None].expand(B, self.num_heads, T, 1)], dim=-1)
+                    bias = bias + slope[b, h, q_idx_l][:, None] * delta.to(dtype=bias.dtype)
+                if gate_kind != "none" and ramp_lambda > 0:
+                    dm = delta_main[b, h, q_idx_l]
+                    w = width[b, h, q_idx_l]
+                    x = (delta.to(dtype=bias.dtype) - dm[:, None]).abs()
+                    x = (x - w[:, None]) / tau
+                    if gate_kind == "relu":
+                        bias = bias - ramp_lambda * torch.relu(x)
+                    else:
+                        bias = bias - ramp_lambda * F.softplus(x)
+                return score + beta * bias.to(dtype=score.dtype)
 
-                q_pos = (q_pos * s).to(dtype=q.dtype)
-                k_pos = (k_pos * s).to(dtype=q.dtype)
-
-                q_bhtd = q.transpose(1, 2)
-                k_bhtd = k.transpose(1, 2)
-                v_bhtd = v.transpose(1, 2)
-                pad_dim = int(q_pos.size(-1))
-                q_aug = torch.cat([q_bhtd, q_pos], dim=-1)
-                k_aug = torch.cat([k_bhtd, k_pos], dim=-1)
-                v_aug = torch.cat([v_bhtd, v_bhtd.new_zeros((B, self.num_heads, T, pad_dim))], dim=-1)
-                # Some kernels are much happier when the head dim is a small multiple (e.g. 8/16).
-                align = int(getattr(args, "spectral_qk_aug_align", 16))
-                if align > 1:
-                    d_aug = int(q_aug.size(-1))
-                    d_aligned = ((d_aug + align - 1) // align) * align
-                    extra = d_aligned - d_aug
-                    if extra > 0:
-                        z = q_aug.new_zeros((B, self.num_heads, T, extra))
-                        q_aug = torch.cat([q_aug, z], dim=-1)
-                        k_aug = torch.cat([k_aug, z], dim=-1)
-                        v_aug = torch.cat([v_aug, z], dim=-1)
-                y = fa(q_aug, k_aug, v_aug, block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
-                y = y[..., : self.head_dim]
-            elif spectral_impl == "score_mod":
-                def score_mod(score, b, h, q_idx, kv_idx):
-                    # FlexAttention may call score_mod with scalar indices during fake/compile; normalize to 1-D.
-                    q = q_idx.to(torch.long).reshape(-1)  # [Q]
-                    k = kv_idx.to(torch.long).reshape(-1)  # [Kv]
-                    # NOTE: max clamp is unnecessary for valid token indices (0..T-1) and
-                    # adds extra work / temporaries during compilation.
-                    delta = (q[:, None] - k[None, :]).clamp(min=0)  # [Q,Kv]
-
-                    A = coeff_cos[b, h, q]  # [Q,K]
-                    Bc = coeff_sin[b, h, q]  # [Q,K]
-
-                    # Accumulate per-frequency to avoid materializing [Q,Kv,K] intermediates (shared-mem blowups).
-                    bias = score.new_zeros(delta.shape, dtype=torch.float32)
-                    for kk in range(K):
-                        bias = bias + A[:, kk : kk + 1] * cos_wD[kk, delta] + Bc[:, kk : kk + 1] * sin_wD[kk, delta]
-
-                    delta_f = delta.to(dtype=bias.dtype)
-                    if subtract_b0:
-                        bias = bias - b0[b, h, q][:, None]
-                    if use_slope:
-                        bias = bias + slope[b, h, q][:, None] * delta_f
-                    if gate_kind != "none" and ramp_lambda > 0:
-                        dm = delta_main[b, h, q][:, None]
-                        w = width[b, h, q][:, None]
-                        x = (delta_f - dm).abs()
-                        x = (x - w) / tau
-                        if gate_kind == "relu":
-                            bias = bias - ramp_lambda * torch.relu(x)
-                        else:
-                            bias = bias - ramp_lambda * F.softplus(x)
-
-                    bias = bias.reshape_as(score)
-                    return score + beta * bias.to(dtype=score.dtype)
-
-                y = fa(
-                    q.transpose(1, 2),
-                    k.transpose(1, 2),
-                    v.transpose(1, 2),
-                    block_mask=block_mask,
-                    score_mod=score_mod,
-                    scale=self.attn_scale,
-                ).transpose(1, 2)
-            else:
-                raise ValueError(f"unknown SCOPE spectral_impl={spectral_impl!r} (expected: qk_aug|score_mod)")
+            y = flex_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                block_mask=block_mask,
+                score_mod=score_mod,
+                scale=self.attn_scale,
+            ).transpose(1, 2)
         else:
-            y = fa(
+            y = flex_attention(
                 q.transpose(1, 2),
                 k.transpose(1, 2),
                 v.transpose(1, 2),
@@ -538,10 +423,8 @@ class GPT(nn.Module):
             docs = (input_seq == 50256).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
-            q = q_idx.to(torch.long)
-            k = kv_idx.to(torch.long)
-            causal_mask = q >= k
-            document_mask = docs[q] == docs[k]
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
         def dense_to_ordered(dense_blockmask: Tensor):
@@ -575,15 +458,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(
-        self,
-        input_seq: Tensor,
-        target_seq: Tensor,
-        sliding_window_num_blocks: Tensor,
-        *,
-        logit_positions: Tensor | None = None,
-        return_metrics: bool = False,
-    ):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
         docs = (input_seq == 50256).cumsum(0)
 
@@ -612,31 +487,13 @@ class GPT(nn.Module):
                 skip_connections.append(x)
 
         x = norm(x)
-        if logit_positions is None:
-            logits = self.lm_head(x)
-            # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-            logits = 30 * torch.sigmoid(logits.float() / 7.5)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
-            if self.training:
-                loss = loss + reg_loss
-            return loss
-
-        # Subset logits path (used by long-context evals): avoid materializing [T,V] logits when only a few positions are needed.
-        assert logit_positions.ndim == 1
-        logit_positions = logit_positions.to(dtype=torch.long)
-        x_sel = x[:, logit_positions]  # [1, N, D]
-        logits = self.lm_head(x_sel)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
-        targets_sel = target_seq[logit_positions]  # [N]
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_sel)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         if self.training:
             loss = loss + reg_loss
-        if not return_metrics:
-            return loss
-        preds = logits.argmax(dim=-1).view(-1).to(dtype=targets_sel.dtype)
-        token_acc = (preds == targets_sel).float().mean()
-        exact_match = (preds == targets_sel).all().float()
-        return loss, token_acc, exact_match
+        return loss
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -677,22 +534,17 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    # NOTE: very long seq lengths can trip FlexAttention/Inductor issues on some PyTorch nightlies.
-    # Use env vars `TRAIN_SEQ_LEN` / `VAL_SEQ_LEN` to override.
-    train_seq_len = 16*1024 # FlexAttention sequence length
-    val_seq_len = train_seq_len # FlexAttention sequence length for validation
+    train_seq_len = 64*1024 # FlexAttention sequence length
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 7050 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
-    seed = 1337 # for reproducible ablations
     # architecture
     vocab_size = 50257
     # SCOPE: spectral bias (see SPEC.md)
     spectral_bias = True
-    spectral_impl = "qk_aug"  # "qk_aug" (no score_mod) | "score_mod"
-    spectral_qk_aug_align = 16  # pad augmented head dim up to a multiple of this (e.g. 8/16) for kernel friendliness
     spectral_K = 6
-    spectral_M = 8
+    spectral_M = 2
     spectral_beta = 0.5
     spectral_L_train = 4096
     spectral_L_max = 1_000_000
@@ -706,215 +558,22 @@ class Hyperparameters:
     spectral_width_min = 32.0
     spectral_width_max = 256.0
     spectral_delta_star_max = None  # None -> use L_max
-    # Schedule an active cap on Δ* (token offsets) during training to avoid early
-    # saturation to the extremes (0 / max), which often shows up as "block0
-    # collapse" + max-distance collapse in telemetry.
-    spectral_delta_star_max_schedule = True
-    spectral_delta_star_max_schedule_start_step = 0
-    spectral_delta_star_max_schedule_steps = 4000
-    spectral_delta_star_max_schedule_min = -1  # <0 -> use spectral_L_train - 1
-    spectral_delta_star_max_schedule_max = -1  # <0 -> use max(train,val) - 1
     spectral_use_pointer_mask = True
-    spectral_pointer_local_blocks = 8
+    spectral_pointer_local_blocks = 16
     spectral_pointer_half_blocks = 4
-    spectral_pointer_budget_blocks = 64  # total pointer KV budget (local + centers + extra) per head/qblock
-    spectral_pointer_budget_is_total = True
-    spectral_pointer_budget_temp = 0.5
-    spectral_pointer_radius_mode = "pi"  # "fixed" | "pi"
-    # Global anchors are a training stability aid but can cause "block0 collapse" if left on.
-    # Default: warmup with 2 blocks, then drop to 0 so pointers must learn nontrivial retrieval.
-    spectral_pointer_global_blocks = 0
-    spectral_pointer_global_blocks_warmup = 2
-    spectral_pointer_global_blocks_warmup_steps = 300
+    spectral_pointer_global_blocks = 2
     spectral_pointer_qblock_rep = "last"  # "last"|"mean"
-    spectral_pointer_doc_clamp = True  # clamp local/pointer windows to doc start blocks
-    spectral_gumbel_topk = False
-    spectral_gumbel_topk_k = 0  # 0 -> use M (no masking)
-    spectral_gumbel_topk_tau = 1.0
-    spectral_gumbel_topk_seed = 0
-    spectral_pointer_reset_len = 0  # tokens; 0 disables
-    spectral_pointer_reset_p = 0.0
-    spectral_pointer_reset_decay_steps = 0
-    spectral_teacher = False
-    spectral_teacher_every = 50
-    spectral_teacher_len = 4096
-    spectral_teacher_layer = 6  # 0-based; mid-layer default for 16-layer stack
-    spectral_teacher_heads = 0  # 0 -> all heads
-    spectral_teacher_temp = 1.0
-    spectral_teacher_lambda_cov = 0.1
-    spectral_teacher_lambda_budget = 0.01
-    spectral_teacher_detach_backbone = True
-    spectral_teacher_nce = False
-    spectral_teacher_nce_pos = 4
-    spectral_teacher_nce_neg = 16
-    spectral_teacher_lambda_nce = 0.1
-    spectral_pointer_schedule = False
+    spectral_pointer_schedule = True
     spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2
-    # Validation override for pointer mask (default: use scheduled state).      
-    spectral_pointer_val_force = False
-    spectral_pointer_val_half_blocks = -1  # <0 -> use spectral_pointer_half_blocks
-    spectral_pi_entropy_floor_frac = 0.25  # only penalize entropy below this (fraction of log(M))
-    spectral_lambda_delta_edge = 1e-4
-    spectral_delta_edge_eps = 0.05
-    spectral_delta_edge_schedule_start_step = 0
-    spectral_delta_edge_schedule_steps = 1000
     spectral_lambda_omega = 1e-5
     spectral_lambda_zero_mean = 1e-4
     spectral_lambda_entropy = 1e-4
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    # Needle-in-a-haystack (synthetic copy/key-value) eval (SPEC.md §8B)
-    needle_eval = False  # run NIAH eval at end (or every N steps)
-    needle_eval_every = 0  # 0 -> only at end
-    needle_seq_len = val_seq_len  # eval context length (must be divisible by 128 and <= max_seq_len)
-    needle_distances = "4096,8192,16384,32768"  # comma-separated token distances between needle and query
-    needle_samples_per_distance = 8
-    needle_anchor_len = 4
-    needle_value_len = 8
-    scope_log_every = 200 # rank0-only SCOPE debug stats
-    save_checkpoint = True  # save a weights checkpoint at end of run (rank0)
-    save_optimizers = False  # include optimizer states (large; usually unnecessary)
-    load_checkpoint = ""  # optional path to a saved `state_step*.pt` to load model weights from
-    # logging / diagnostics
-    log_all_ranks = False  # write one logfile per rank (debugging)       
-    flexattn_dynamo_disable = False  # graph-break around FlexAttention (compiler workaround)
-    flexattn_compile = True  # compile FlexAttention standalone when graph-broken (keeps fused kernel)
-    # torch.compile controls (FlexAttention still JITs its own kernels)   
-    torch_compile = True
-    torch_compile_backend = "inductor"
-    torch_compile_mode = "default"  # "default"|"reduce-overhead"|"max-autotune"
-    torch_compile_fullgraph = False
-    torch_dynamo_verbose = False
-    torch_dynamo_suppress_errors = False  # fallback to eager inside torch.compile
-    torch_compile_fallback_to_eager = True  # if compile errors escape, retry eager
+    save_checkpoint = False
 args = Hyperparameters()
-
-def _env_str(key: str, default: str) -> str:
-    v = os.environ.get(key)
-    return default if v is None else str(v)
-
-def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key)
-    return default if v is None else int(v)
-
-def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key)
-    return default if v is None else float(v)
-
-def _env_bool(key: str, default: bool) -> bool:
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise ValueError(f"invalid boolean env var {key}={v!r}")
-
-# Lightweight env overrides (for ablations / Vast.ai runs).
-args.train_files = _env_str("TRAIN_FILES", args.train_files)
-args.val_files = _env_str("VAL_FILES", args.val_files)
-args.val_tokens = _env_int("VAL_TOKENS", args.val_tokens)
-args.train_seq_len = _env_int("TRAIN_SEQ_LEN", args.train_seq_len)
-args.val_seq_len = _env_int("VAL_SEQ_LEN", args.val_seq_len)
-args.num_iterations = _env_int("NUM_ITERATIONS", args.num_iterations)     
-args.val_loss_every = _env_int("VAL_LOSS_EVERY", args.val_loss_every)     
-args.needle_eval = _env_bool("NEEDLE_EVAL", args.needle_eval)
-args.needle_eval_every = _env_int("NEEDLE_EVAL_EVERY", args.needle_eval_every)
-args.needle_seq_len = _env_int("NEEDLE_SEQ_LEN", args.needle_seq_len)
-args.needle_distances = _env_str("NEEDLE_DISTANCES", args.needle_distances)
-args.needle_samples_per_distance = _env_int("NEEDLE_SAMPLES_PER_DISTANCE", args.needle_samples_per_distance)
-args.needle_anchor_len = _env_int("NEEDLE_ANCHOR_LEN", args.needle_anchor_len)
-args.needle_value_len = _env_int("NEEDLE_VALUE_LEN", args.needle_value_len)
-args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)  
-args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint)       
-args.save_optimizers = _env_bool("SAVE_OPTIMIZERS", args.save_optimizers)
-args.load_checkpoint = _env_str("LOAD_CHECKPOINT", args.load_checkpoint)        
-args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)
-args.flexattn_dynamo_disable = _env_bool("FLEXATTN_DYNAMO_DISABLE", args.flexattn_dynamo_disable)
-args.flexattn_compile = _env_bool("FLEXATTN_COMPILE", args.flexattn_compile)
-args.cooldown_frac = _env_float("COOLDOWN_FRAC", args.cooldown_frac)      
-args.seed = _env_int("SEED", args.seed)
-
-# SCOPE toggles/knobs.
-args.spectral_bias = _env_bool("SPECTRAL_BIAS", args.spectral_bias)
-args.spectral_impl = _env_str("SPECTRAL_IMPL", args.spectral_impl)
-args.spectral_qk_aug_align = _env_int("SPECTRAL_QK_AUG_ALIGN", args.spectral_qk_aug_align)
-args.spectral_K = _env_int("SPECTRAL_K", args.spectral_K)
-args.spectral_M = _env_int("SPECTRAL_M", args.spectral_M)
-args.spectral_beta = _env_float("SPECTRAL_BETA", args.spectral_beta)
-args.spectral_use_slope = _env_bool("SPECTRAL_USE_SLOPE", args.spectral_use_slope)
-args.spectral_ramp_lambda = _env_float("SPECTRAL_RAMP_LAMBDA", args.spectral_ramp_lambda)
-args.spectral_gate_kind = _env_str("SPECTRAL_GATE_KIND", args.spectral_gate_kind)
-args.spectral_use_pointer_mask = _env_bool("SPECTRAL_USE_POINTER_MASK", args.spectral_use_pointer_mask)
-args.spectral_pointer_schedule = _env_bool("SPECTRAL_POINTER_SCHEDULE", args.spectral_pointer_schedule)
-args.spectral_pointer_schedule_disable_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_DISABLE_STEPS", args.spectral_pointer_schedule_disable_steps)
-args.spectral_pointer_schedule_mid_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_MID_STEPS", args.spectral_pointer_schedule_mid_steps)
-args.spectral_pointer_schedule_half_blocks_mid = _env_int("SPECTRAL_POINTER_SCHEDULE_HALF_BLOCKS_MID", args.spectral_pointer_schedule_half_blocks_mid)
-args.spectral_pointer_val_force = _env_bool("SPECTRAL_POINTER_VAL_FORCE", args.spectral_pointer_val_force)
-args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOCKS", args.spectral_pointer_val_half_blocks)
-args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
-args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
-args.spectral_pointer_budget_blocks = _env_int("SPECTRAL_POINTER_BUDGET_BLOCKS", args.spectral_pointer_budget_blocks)
-args.spectral_pointer_budget_is_total = _env_bool("SPECTRAL_POINTER_BUDGET_IS_TOTAL", args.spectral_pointer_budget_is_total)
-args.spectral_pointer_budget_temp = _env_float("SPECTRAL_POINTER_BUDGET_TEMP", args.spectral_pointer_budget_temp)
-args.spectral_pointer_radius_mode = _env_str("SPECTRAL_POINTER_RADIUS_MODE", args.spectral_pointer_radius_mode).strip().lower()
-args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
-args.spectral_pointer_global_blocks_warmup = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP", args.spectral_pointer_global_blocks_warmup)
-args.spectral_pointer_global_blocks_warmup_steps = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS", args.spectral_pointer_global_blocks_warmup_steps)
-args.spectral_pointer_doc_clamp = _env_bool("SPECTRAL_POINTER_DOC_CLAMP", args.spectral_pointer_doc_clamp)
-args.spectral_gumbel_topk = _env_bool("SPECTRAL_GUMBEL_TOPK", args.spectral_gumbel_topk)
-args.spectral_gumbel_topk_k = _env_int("SPECTRAL_GUMBEL_TOPK_K", args.spectral_gumbel_topk_k)
-args.spectral_gumbel_topk_tau = _env_float("SPECTRAL_GUMBEL_TOPK_TAU", args.spectral_gumbel_topk_tau)
-args.spectral_gumbel_topk_seed = _env_int("SPECTRAL_GUMBEL_TOPK_SEED", args.spectral_gumbel_topk_seed)
-args.spectral_pointer_reset_len = _env_int("SPECTRAL_POINTER_RESET_LEN", args.spectral_pointer_reset_len)
-args.spectral_pointer_reset_p = _env_float("SPECTRAL_POINTER_RESET_P", args.spectral_pointer_reset_p)
-args.spectral_pointer_reset_decay_steps = _env_int("SPECTRAL_POINTER_RESET_DECAY_STEPS", args.spectral_pointer_reset_decay_steps)
-args.spectral_teacher = _env_bool("SPECTRAL_TEACHER", args.spectral_teacher)
-args.spectral_teacher_every = _env_int("SPECTRAL_TEACHER_EVERY", args.spectral_teacher_every)
-args.spectral_teacher_len = _env_int("SPECTRAL_TEACHER_LEN", args.spectral_teacher_len)
-args.spectral_teacher_layer = _env_int("SPECTRAL_TEACHER_LAYER", args.spectral_teacher_layer)
-args.spectral_teacher_heads = _env_int("SPECTRAL_TEACHER_HEADS", args.spectral_teacher_heads)
-args.spectral_teacher_temp = _env_float("SPECTRAL_TEACHER_TEMP", args.spectral_teacher_temp)
-args.spectral_teacher_lambda_cov = _env_float("SPECTRAL_TEACHER_LAMBDA_COV", args.spectral_teacher_lambda_cov)
-args.spectral_teacher_lambda_budget = _env_float("SPECTRAL_TEACHER_LAMBDA_BUDGET", args.spectral_teacher_lambda_budget)
-args.spectral_teacher_detach_backbone = _env_bool("SPECTRAL_TEACHER_DETACH_BACKBONE", args.spectral_teacher_detach_backbone)
-args.spectral_teacher_nce = _env_bool("SPECTRAL_TEACHER_NCE", args.spectral_teacher_nce)
-args.spectral_teacher_nce_pos = _env_int("SPECTRAL_TEACHER_NCE_POS", args.spectral_teacher_nce_pos)
-args.spectral_teacher_nce_neg = _env_int("SPECTRAL_TEACHER_NCE_NEG", args.spectral_teacher_nce_neg)
-args.spectral_teacher_lambda_nce = _env_float("SPECTRAL_TEACHER_LAMBDA_NCE", args.spectral_teacher_lambda_nce)
-args.spectral_pi_entropy_floor_frac = _env_float("SPECTRAL_PI_ENTROPY_FLOOR_FRAC", args.spectral_pi_entropy_floor_frac)
-args.spectral_lambda_delta_edge = _env_float("SPECTRAL_LAMBDA_DELTA_EDGE", args.spectral_lambda_delta_edge)
-args.spectral_delta_edge_eps = _env_float("SPECTRAL_DELTA_EDGE_EPS", args.spectral_delta_edge_eps)
-args.spectral_delta_edge_schedule_start_step = _env_int("SPECTRAL_DELTA_EDGE_SCHEDULE_START_STEP", args.spectral_delta_edge_schedule_start_step)
-args.spectral_delta_edge_schedule_steps = _env_int("SPECTRAL_DELTA_EDGE_SCHEDULE_STEPS", args.spectral_delta_edge_schedule_steps)
-args.spectral_delta_star_max_schedule = _env_bool("SPECTRAL_DELTA_STAR_MAX_SCHEDULE", args.spectral_delta_star_max_schedule)
-args.spectral_delta_star_max_schedule_start_step = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP", args.spectral_delta_star_max_schedule_start_step)
-args.spectral_delta_star_max_schedule_steps = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS", args.spectral_delta_star_max_schedule_steps)
-args.spectral_delta_star_max_schedule_min = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MIN", args.spectral_delta_star_max_schedule_min)
-args.spectral_delta_star_max_schedule_max = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MAX", args.spectral_delta_star_max_schedule_max)
-
-# torch.compile toggles/knobs.
-args.torch_compile = _env_bool("TORCH_COMPILE", args.torch_compile)
-args.torch_compile_backend = _env_str("TORCH_COMPILE_BACKEND", args.torch_compile_backend)
-args.torch_compile_mode = _env_str("TORCH_COMPILE_MODE", args.torch_compile_mode)
-args.torch_compile_fullgraph = _env_bool("TORCH_COMPILE_FULLGRAPH", args.torch_compile_fullgraph)
-args.torch_dynamo_verbose = _env_bool("TORCHDYNAMO_VERBOSE", args.torch_dynamo_verbose)
-args.torch_dynamo_suppress_errors = _env_bool("TORCHDYNAMO_SUPPRESS_ERRORS", args.torch_dynamo_suppress_errors)
-args.torch_compile_fallback_to_eager = _env_bool("TORCH_COMPILE_FALLBACK_TO_EAGER", args.torch_compile_fallback_to_eager)
-
-# Derived defaults that should reflect env overrides.
-if os.environ.get("NEEDLE_SEQ_LEN") is None:
-    args.needle_seq_len = args.val_seq_len
-if args.spectral_delta_star_max_schedule_min < 0:
-    args.spectral_delta_star_max_schedule_min = int(args.spectral_L_train) - 1
-if args.spectral_delta_star_max_schedule_max < 0:
-    args.spectral_delta_star_max_schedule_max = max(int(args.train_seq_len), int(args.val_seq_len)) - 1
-if args.spectral_delta_star_max_schedule_min > args.spectral_delta_star_max_schedule_max:
-    args.spectral_delta_star_max_schedule_min = int(args.spectral_delta_star_max_schedule_max)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -927,66 +586,19 @@ dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-# Best-effort cleanup on exceptions (avoids NCCL resource leak warnings).
-import atexit
-def _destroy_process_group():
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-atexit.register(_destroy_process_group)
-
-# Deterministic init across ablation runs (rank0 params are broadcast anyway).
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed_all(args.seed)
-random.seed(args.seed)
-import numpy as np
-np.random.seed(args.seed)
-
 # begin logging
-log_dir = os.environ.get("LOG_DIR", "logs")
-run_name = os.environ.get("RUN_NAME", "").strip()
-run_uuid = str(uuid.uuid4()) if master_process else ""
-_uuid_list = [run_uuid]
-dist.broadcast_object_list(_uuid_list, src=0)
-run_uuid = _uuid_list[0]
-run_prefix = f"{run_name}_" if run_name else ""
-run_id = f"{run_prefix}{run_uuid}"
-os.makedirs(log_dir, exist_ok=True)
 logfile = None
-if args.log_all_ranks:
-    logfile = f"{log_dir}/{run_id}_rank{rank}.txt"
-    if master_process:
-        print(f"{log_dir}/{run_id}_rank*.txt")
-else:
-    logfile = f"{log_dir}/{run_id}.txt" if master_process else None
-    if master_process:
-        print(logfile)
-
-def _write_log(s: str):
-    if logfile is None:
-        return
-    with open(logfile, "a") as f:
-        print(s, file=f)
+if master_process:
+    run_id = uuid.uuid4()
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{run_id}.txt"
+    print(logfile)
 def print0(s, console=False):
     if master_process:
-        _write_log(s)
-        if console:
-            print(s)
-def print_rank(s, console=False):
-    _write_log(s)
-    if console:
-        print(f"[rank{rank}] {s}")
-
-# Ensure uncaught exceptions are captured in logs (useful for compiler failures).
-_orig_excepthook = sys.excepthook
-def _logging_excepthook(exc_type, exc, tb):
-    import traceback
-    msg = "".join(traceback.format_exception(exc_type, exc, tb))
-    try:
-        print_rank(msg, console=True)
-    except Exception:
-        print(msg)
-    _orig_excepthook(exc_type, exc, tb)
-sys.excepthook = _logging_excepthook
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -999,110 +611,6 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
-print0(
-    json.dumps(
-        dict(
-            tag="RUN_CFG",
-            seed=int(args.seed),
-            train_seq_len=int(args.train_seq_len),
-            val_seq_len=int(args.val_seq_len),
-            num_iterations=int(args.num_iterations),
-            val_loss_every=int(args.val_loss_every),
-            world_size=int(world_size),
-            torch_compile=dict(
-                enabled=bool(args.torch_compile),
-                backend=str(args.torch_compile_backend),
-                mode=str(args.torch_compile_mode),
-                fullgraph=bool(args.torch_compile_fullgraph),
-                dynamo_verbose=bool(args.torch_dynamo_verbose),
-                dynamo_suppress_errors=bool(args.torch_dynamo_suppress_errors),
-                fallback_to_eager=bool(args.torch_compile_fallback_to_eager),
-            ),
-            flexattn=dict(
-                dynamo_disable=bool(args.flexattn_dynamo_disable),
-                compile=bool(args.flexattn_compile),
-            ),
-            checkpoint=dict(load=str(args.load_checkpoint) if str(args.load_checkpoint) else None),
-            scope=dict(
-                enabled=bool(args.spectral_bias),
-                impl=str(args.spectral_impl),
-                qk_aug_align=int(getattr(args, "spectral_qk_aug_align", 0)),
-                K=int(args.spectral_K),
-                M=int(args.spectral_M),
-                beta=float(args.spectral_beta),
-                use_slope=bool(args.spectral_use_slope),
-                ramp_lambda=float(args.spectral_ramp_lambda),
-                gate_kind=str(args.spectral_gate_kind),
-                delta_star=dict(
-                    hard_cap=int(args.spectral_L_max if args.spectral_delta_star_max is None else args.spectral_delta_star_max),
-                    schedule=bool(args.spectral_delta_star_max_schedule),
-                    schedule_start=int(args.spectral_delta_star_max_schedule_start_step),
-                    schedule_steps=int(args.spectral_delta_star_max_schedule_steps),
-                    schedule_min=int(args.spectral_delta_star_max_schedule_min),
-                    schedule_max=int(args.spectral_delta_star_max_schedule_max),
-                ),
-                use_pointer_mask=bool(args.spectral_use_pointer_mask),
-                pointer_schedule=bool(args.spectral_pointer_schedule),
-                pointer_local_blocks=int(args.spectral_pointer_local_blocks),
-                pointer_half_blocks=int(args.spectral_pointer_half_blocks),
-                pointer_budget_blocks=int(args.spectral_pointer_budget_blocks),
-                pointer_budget_is_total=bool(args.spectral_pointer_budget_is_total),
-                pointer_budget_temp=float(args.spectral_pointer_budget_temp),
-                pointer_radius_mode=str(args.spectral_pointer_radius_mode),
-                pointer_global_blocks=int(args.spectral_pointer_global_blocks),
-                pointer_global_blocks_warmup=int(args.spectral_pointer_global_blocks_warmup),
-                pointer_global_blocks_warmup_steps=int(args.spectral_pointer_global_blocks_warmup_steps),
-                pointer_qblock_rep=str(args.spectral_pointer_qblock_rep),
-                pointer_doc_clamp=bool(args.spectral_pointer_doc_clamp),
-                gumbel_topk=dict(
-                    enabled=bool(args.spectral_gumbel_topk),
-                    k=int(args.spectral_gumbel_topk_k),
-                    tau=float(args.spectral_gumbel_topk_tau),
-                    seed=int(args.spectral_gumbel_topk_seed),
-                ),
-                pointer_reset=dict(
-                    reset_len=int(args.spectral_pointer_reset_len),
-                    p=float(args.spectral_pointer_reset_p),
-                    decay_steps=int(args.spectral_pointer_reset_decay_steps),
-                ),
-                teacher=dict(
-                    enabled=bool(args.spectral_teacher),
-                    every=int(args.spectral_teacher_every),
-                    len_tokens=int(args.spectral_teacher_len),
-                    layer=int(args.spectral_teacher_layer),
-                    heads=int(args.spectral_teacher_heads),
-                    temp=float(args.spectral_teacher_temp),
-                    lambda_cov=float(args.spectral_teacher_lambda_cov),
-                    lambda_budget=float(args.spectral_teacher_lambda_budget),
-                    detach_backbone=bool(args.spectral_teacher_detach_backbone),
-                    nce=dict(
-                        enabled=bool(args.spectral_teacher_nce),
-                        pos=int(args.spectral_teacher_nce_pos),
-                        neg=int(args.spectral_teacher_nce_neg),
-                        lambda_nce=float(args.spectral_teacher_lambda_nce),
-                    ),
-                ),
-                val_force=bool(args.spectral_pointer_val_force),
-                val_half_blocks=int(args.spectral_pointer_val_half_blocks),
-                pi_entropy_floor_frac=float(args.spectral_pi_entropy_floor_frac),
-                lambda_delta_edge=float(args.spectral_lambda_delta_edge),
-                delta_edge_eps=float(args.spectral_delta_edge_eps),
-                delta_edge_schedule_start_step=int(args.spectral_delta_edge_schedule_start_step),
-                delta_edge_schedule_steps=int(args.spectral_delta_edge_schedule_steps),
-            ),
-            needle_eval=dict(
-                enabled=bool(args.needle_eval),
-                every=int(args.needle_eval_every),
-                seq_len=int(args.needle_seq_len),
-                distances=str(args.needle_distances),
-                samples_per_distance=int(args.needle_samples_per_distance),
-                anchor_len=int(args.needle_anchor_len),
-                value_len=int(args.needle_value_len),
-            ),
-        )
-    ),
-    console=True,
-)
 
 ########################################
 #    Construct model and optimizer     #
@@ -1130,71 +638,15 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
                            use_pointer_mask=args.spectral_use_pointer_mask,
                            pointer_local_blocks=args.spectral_pointer_local_blocks,
                            pointer_half_blocks=args.spectral_pointer_half_blocks,
-                            pointer_budget_blocks=args.spectral_pointer_budget_blocks,
-                            pointer_budget_is_total=args.spectral_pointer_budget_is_total,
-                            pointer_budget_temp=args.spectral_pointer_budget_temp,
-                            pointer_radius_mode=args.spectral_pointer_radius_mode,
-                             pointer_global_blocks=max(
-                                 int(args.spectral_pointer_global_blocks),
-                                 int(args.spectral_pointer_global_blocks_warmup),
-                             ),
-                            pointer_qblock_rep=args.spectral_pointer_qblock_rep,
-                            pointer_doc_clamp=args.spectral_pointer_doc_clamp,
-                            gumbel_topk=args.spectral_gumbel_topk,
-                            gumbel_topk_k=args.spectral_gumbel_topk_k,
-                            gumbel_topk_tau=args.spectral_gumbel_topk_tau,
-                            gumbel_topk_seed=args.spectral_gumbel_topk_seed,
-                            pointer_reset_len=args.spectral_pointer_reset_len,
-                            pi_entropy_floor_frac=args.spectral_pi_entropy_floor_frac,
-                            lambda_delta_edge=args.spectral_lambda_delta_edge,
-                            delta_edge_eps=args.spectral_delta_edge_eps,
-                            lambda_omega=args.spectral_lambda_omega,
-                            lambda_zero_mean=args.spectral_lambda_zero_mean,
+                           pointer_global_blocks=args.spectral_pointer_global_blocks,
+                           pointer_qblock_rep=args.spectral_pointer_qblock_rep,
+                           lambda_omega=args.spectral_lambda_omega,
+                           lambda_zero_mean=args.spectral_lambda_zero_mean,
                            lambda_entropy=args.spectral_lambda_entropy,
-                           debug_stats=master_process,
                        )).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
-
-def _strip_state_dict_prefix(state: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
-    if not prefix:
-        return state
-    if not any(k.startswith(prefix) for k in state.keys()):
-        return state
-    return { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items() }
-
-if str(args.load_checkpoint):
-    if master_process:
-        ckpt = torch.load(str(args.load_checkpoint), map_location="cpu")
-        state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-        if not isinstance(state, dict):
-            raise ValueError(f"LOAD_CHECKPOINT expected a state-dict-like object, got {type(state)}")
-        used_prefix = None
-        last_err = None
-        for prefix in ("", "_orig_mod.", "module."):
-            try:
-                to_load = state if prefix == "" else _strip_state_dict_prefix(state, prefix)
-                model.load_state_dict(to_load, strict=True)
-                used_prefix = prefix
-                break
-            except RuntimeError as e:
-                last_err = e
-        if used_prefix is None:
-            assert last_err is not None
-            raise last_err
-        print0(
-            json.dumps(
-                dict(
-                    tag="CHECKPOINT_LOADED",
-                    path=str(args.load_checkpoint),
-                    step=int(ckpt.get("step", -1)) if isinstance(ckpt, dict) else -1,
-                    used_prefix=str(used_prefix),
-                )
-            ),
-            console=True,
-        )
-    # Sync model weights across ranks (rank0 is source-of-truth).
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1204,1047 +656,31 @@ if args.spectral_bias:
         sb = getattr(m, "spectral_bias", None)
         if sb is not None:
             spectral_bias_modules.append(sb)
-if master_process and spectral_bias_modules:
-    sb0 = spectral_bias_modules[0]
-    print0(
-        json.dumps(
-            dict(
-                tag="SCOPE_BINS",
-                delta_tokens_edges=sb0._dbg_token_edges.tolist(),
-                delta_blocks_edges=sb0._dbg_block_edges.tolist(),
-                ptr_center_blocks_edges=sb0._dbg_block_edges.tolist(),
-                kv_unique_blocks_max=int(sb0._dbg_kv_unique_hist.numel() - 1),
-                ptr_extra_sum_max=int(sb0._dbg_ptr_extra_sum_hist.numel() - 1),
-            )
-        ),
-        console=True,
-    )
-pointer_mask_state = dict(enabled=None, half_blocks=None, global_blocks=None)   
+pointer_mask_state = dict(enabled=None, half_blocks=None)
 def maybe_update_pointer_mask(step: int):
     if not spectral_bias_modules:
         return
     if not args.spectral_use_pointer_mask:
         enabled = False
         half_blocks = 0
-        global_blocks = 0
     elif not args.spectral_pointer_schedule:
         enabled = True
         half_blocks = int(args.spectral_pointer_half_blocks)
-        global_blocks = int(args.spectral_pointer_global_blocks)
     elif step < args.spectral_pointer_schedule_disable_steps:
         enabled = False
         half_blocks = 0
-        global_blocks = int(args.spectral_pointer_global_blocks_warmup)
     elif step < args.spectral_pointer_schedule_mid_steps:
         enabled = True
         half_blocks = min(int(args.spectral_pointer_schedule_half_blocks_mid), int(args.spectral_pointer_half_blocks))
-        global_blocks = int(args.spectral_pointer_global_blocks_warmup)
     else:
         enabled = True
         half_blocks = int(args.spectral_pointer_half_blocks)
-        global_blocks = int(args.spectral_pointer_global_blocks)
-    # Independently schedule global anchors (warmup -> off) to avoid block0 collapse.
-    if args.spectral_use_pointer_mask:
-        if step < int(args.spectral_pointer_global_blocks_warmup_steps):
-            global_blocks = int(args.spectral_pointer_global_blocks_warmup)
-        else:
-            global_blocks = int(args.spectral_pointer_global_blocks)
-
-    if (
-        pointer_mask_state["enabled"] == enabled
-        and pointer_mask_state["half_blocks"] == half_blocks
-        and pointer_mask_state["global_blocks"] == global_blocks
-    ):
+    if pointer_mask_state["enabled"] == enabled and pointer_mask_state["half_blocks"] == half_blocks:
         return
     for sb in spectral_bias_modules:
-        sb.set_pointer_mask_state(enabled=enabled, half_blocks=half_blocks, global_blocks=global_blocks)
+        sb.set_pointer_mask_state(enabled=enabled, half_blocks=half_blocks)
     pointer_mask_state["enabled"] = enabled
     pointer_mask_state["half_blocks"] = half_blocks
-    pointer_mask_state["global_blocks"] = global_blocks
-
-pointer_reset_state = dict(enabled=None, reset_len=None, p_active=None)
-def maybe_update_pointer_reset(step: int):
-    if not spectral_bias_modules:
-        return
-    reset_len = int(args.spectral_pointer_reset_len)
-    p0 = float(args.spectral_pointer_reset_p)
-    decay_steps = int(args.spectral_pointer_reset_decay_steps)
-    if reset_len <= 0 or p0 <= 0.0:
-        enabled = False
-        p_active = 0.0
-    else:
-        if decay_steps > 0:
-            t = min(max(step / float(decay_steps), 0.0), 1.0)
-            p_active = p0 * (1.0 - t)
-        else:
-            p_active = p0
-        rng = random.Random(int(args.seed) + 1000003 * int(step))
-        enabled = (p_active > 0.0) and (rng.random() < p_active)
-
-    if (
-        pointer_reset_state["enabled"] == enabled
-        and pointer_reset_state["reset_len"] == reset_len
-        and pointer_reset_state["p_active"] == p_active
-    ):
-        return
-    for sb in spectral_bias_modules:
-        sb.set_pointer_reset_state(enabled=enabled, reset_len=reset_len)
-    pointer_reset_state["enabled"] = enabled
-    pointer_reset_state["reset_len"] = reset_len
-    pointer_reset_state["p_active"] = p_active
-
-teacher_loss_state = dict(loss=None, cov=None, budget=None, nce=None, step=None)
-teacher_stats_state = dict(
-    teacher_ran=False,
-    teacher_skip_reason="not_time",
-    n_valid_q=0,
-    n_valid_blocks=0,
-    n_pos=0,
-    n_neg=0,
-    teacher_nce_used=False,
-    teacher_nce_pos_used=0,
-    teacher_nce_neg_used=0,
-    teacher_target_entropy=0.0,
-    teacher_top1_mass=0.0,
-    step=None,
-    call_count=0,
-    last_call_step=None,
-)
-def maybe_update_gumbel_seed(step: int):
-    if not spectral_bias_modules:
-        return
-    if not args.spectral_gumbel_topk:
-        return
-    base = int(args.spectral_gumbel_topk_seed)
-    if base == 0:
-        base = int(args.seed)
-    for idx, sb in enumerate(spectral_bias_modules):
-        sb.set_gumbel_seed(seed=base + 10007 * int(step) + idx)
-
-delta_star_max_state = dict(max_tokens=None)
-def maybe_update_delta_star_max(step: int):
-    if not spectral_bias_modules:
-        return
-    if not args.spectral_bias:
-        return
-
-    if not args.spectral_delta_star_max_schedule:
-        desired = int(args.spectral_L_max if args.spectral_delta_star_max is None else args.spectral_delta_star_max)
-    else:
-        start = int(args.spectral_delta_star_max_schedule_start_step)
-        steps = int(args.spectral_delta_star_max_schedule_steps)
-        min_cap = int(args.spectral_delta_star_max_schedule_min)
-        max_cap = int(args.spectral_delta_star_max_schedule_max)
-        if step < start:
-            desired = min_cap
-        elif steps <= 0:
-            desired = max_cap
-        else:
-            t = (step - start) / float(steps)
-            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-            desired = int(round(min_cap + t * (max_cap - min_cap)))
-    desired = max(0, desired)
-    hard_cap = int(args.spectral_L_max if args.spectral_delta_star_max is None else args.spectral_delta_star_max)
-    desired = min(desired, hard_cap)
-
-    if delta_star_max_state["max_tokens"] == desired:
-        return
-    for sb in spectral_bias_modules:
-        sb.set_delta_star_max_active(max_tokens=desired)
-    delta_star_max_state["max_tokens"] = desired
-
-delta_edge_state = dict(eps=None)
-def maybe_update_delta_edge_eps(step: int):
-    if not spectral_bias_modules or not args.spectral_bias:
-        return
-    if float(args.spectral_lambda_delta_edge) <= 0.0 or float(args.spectral_delta_edge_eps) <= 0.0:
-        desired = 0.0
-    else:
-        base = float(args.spectral_delta_edge_eps)
-        start = int(args.spectral_delta_edge_schedule_start_step)
-        steps = int(args.spectral_delta_edge_schedule_steps)
-        if step < start:
-            desired = base
-        elif steps <= 0:
-            desired = 0.0
-        else:
-            t = (step - start) / float(steps)
-            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-            desired = base * (1.0 - t)
-    if delta_edge_state["eps"] == desired:
-        return
-    for sb in spectral_bias_modules:
-        sb.set_delta_edge_eps_active(eps=desired)
-    delta_edge_state["eps"] = desired
-
-def _hist_percentile(hist: Tensor, q: float) -> int | None:
-    total = int(hist.sum().item())
-    if total <= 0:
-        return None
-    cdf = hist.cumsum(0)
-    target = q * total
-    idx = int((cdf >= target).nonzero(as_tuple=False)[0].item())
-    return idx
-
-def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_window_blocks: int | None = None):
-    if not master_process:
-        return
-    if not spectral_bias_modules:
-        return
-    if args.scope_log_every <= 0:
-        return
-
-    sbs = spectral_bias_modules
-    sb0 = sbs[0]
-
-    # Derived pointer-budget telemetry (helps explain "knob changed but mask didn't").
-    budget_eff = None
-    try:
-        if bool(pointer_mask_state.get("enabled")):
-            m_peaks = int(getattr(sb0, "M", 0) or 0)
-            local_blocks = int(getattr(sb0, "pointer_local_blocks", 0) or 0)
-            half_max = int(getattr(sb0, "pointer_half_blocks", 0) or 0)
-            half_active = int(pointer_mask_state.get("half_blocks") or 0)
-            budget_cfg = int(getattr(sb0, "pointer_budget_blocks", 0) or 0)
-            budget_is_total = bool(getattr(sb0, "pointer_budget_is_total", True))
-
-            max_sum_radii_max = max(m_peaks, 0) * max(half_max, 0)
-            max_sum_radii_active = max(m_peaks, 0) * max(half_active, 0)
-            max_extra_blocks_max = 2 * max_sum_radii_max
-            local_blocks = max(local_blocks, 0)
-            m_peaks = max(m_peaks, 0)
-            total_cap_blocks = local_blocks + m_peaks + max_extra_blocks_max
-
-            if budget_is_total:
-                total_req_blocks = max(budget_cfg, 0)
-                total_clipped_blocks = min(total_req_blocks, total_cap_blocks)
-                extra_req_blocks = max(total_clipped_blocks - local_blocks - m_peaks, 0)
-                clipped_total = bool(total_req_blocks > total_cap_blocks)
-            else:
-                # Compatibility mode: interpret cfg as extra blocks (outside local+centers).
-                extra_req_blocks = min(max(budget_cfg, 0), max_extra_blocks_max)
-                total_req_blocks = local_blocks + m_peaks + max(budget_cfg, 0)
-                total_clipped_blocks = local_blocks + m_peaks + extra_req_blocks
-                clipped_total = bool(max(budget_cfg, 0) > max_extra_blocks_max)
-
-            extra_req_radii = int(extra_req_blocks) // 2
-            extra_active_radii = min(extra_req_radii, max_sum_radii_active)
-            extra_active_blocks = int(2 * extra_active_radii)
-            total_active_blocks = int(local_blocks + m_peaks + extra_active_blocks)
-            clipped_active = bool(extra_active_radii < extra_req_radii)
-            budget_eff = dict(
-                peaks=int(m_peaks),
-                half_blocks_max=int(half_max),
-                half_blocks_active=int(half_active),
-                budget_cfg_blocks=int(budget_cfg),
-                budget_is_total=bool(budget_is_total),
-                total_req_blocks=int(total_req_blocks),
-                total_cap_blocks=int(total_cap_blocks),
-                total_clipped_blocks=int(total_clipped_blocks),
-                extra_req_blocks=int(extra_req_blocks),
-                extra_req_radii=int(extra_req_radii),
-                extra_active_radii=int(extra_active_radii),
-                extra_active_blocks=int(extra_active_blocks),
-                total_active_blocks=int(total_active_blocks),
-                clipped_total=bool(clipped_total),
-                clipped_active=bool(clipped_active),
-            )
-    except Exception:
-        budget_eff = None
-
-    kv_hist = sum((sb._dbg_kv_unique_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_kv_unique_hist))
-    kv_total = int(kv_hist.sum().item())
-    if kv_total > 0:
-        ks = torch.arange(kv_hist.numel(), device=kv_hist.device, dtype=torch.float32)
-        kv_mean = float((ks * kv_hist.float()).sum().item() / kv_total)
-        kv_p50 = _hist_percentile(kv_hist, 0.50)
-        kv_p90 = _hist_percentile(kv_hist, 0.90)
-        kv_min = int(torch.nonzero(kv_hist, as_tuple=False).min().item())
-        kv_max = int(torch.nonzero(kv_hist, as_tuple=False).max().item())       
-    else:
-        kv_mean, kv_p50, kv_p90, kv_min, kv_max = None, None, None, None, None
-
-    dt_hist = sum((sb._dbg_delta_tokens_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_tokens_hist))
-    db_hist = sum((sb._dbg_delta_blocks_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_blocks_hist))
-    pc_hist = sum((sb._dbg_ptr_center_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_center_hist))
-    pr_hist = sum((sb._dbg_ptr_radius_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_radius_hist))
-    pe_hist = sum((sb._dbg_ptr_extra_sum_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_extra_sum_hist))
-
-    dt_total = int(dt_hist.sum().item())
-    db_total = int(db_hist.sum().item())
-    pc_total = int(pc_hist.sum().item())
-    pr_total = int(pr_hist.sum().item())
-    pe_total = int(pe_hist.sum().item())
-
-    def _to_frac_list(hist: Tensor, total: int) -> list[float]:
-        if total <= 0:
-            return []
-        return (hist.float() / float(total)).tolist()
-
-    outside_fracs = torch.stack([sb._dbg_ptr_outside_local_frac for sb in sbs]).float()
-    block0_fracs = torch.stack([sb._dbg_ptr_block0_frac for sb in sbs]).float()
-    block0_excl_fracs = torch.stack([sb._dbg_ptr_block0_frac_excl for sb in sbs]).float()
-    docstart_fracs = torch.stack([sb._dbg_ptr_docstart_frac for sb in sbs]).float()
-    radius0_fracs = torch.stack([sb._dbg_ptr_radius0_frac for sb in sbs]).float()
-    pi_entropies = torch.stack([sb._dbg_pi_entropy_mean for sb in sbs]).float()
-
-    reg_omega = float(torch.stack([sb._dbg_reg_omega for sb in sbs]).sum().item())
-    reg_entropy = float(torch.stack([sb._dbg_reg_entropy for sb in sbs]).sum().item())
-    reg_delta_edge = float(torch.stack([sb._dbg_reg_delta_edge for sb in sbs]).sum().item())
-    reg_zero_mean = float(torch.stack([sb._dbg_reg_zero_mean for sb in sbs]).sum().item())
-    reg_total = float(torch.stack([sb._dbg_reg_total for sb in sbs]).sum().item())
-
-    payload = dict(
-        tag="SCOPE_STATS",
-        step=int(step),
-        train_loss=(float(train_loss.item()) if train_loss is not None else None),
-        sliding_window_blocks=int(sliding_window_blocks) if sliding_window_blocks is not None else None,
-        pointer_mask=dict(
-            enabled=bool(pointer_mask_state["enabled"]),
-            half_blocks=int(pointer_mask_state["half_blocks"]),
-            global_blocks=int(pointer_mask_state["global_blocks"]),
-        ),
-        pointer_reset=dict(
-            enabled=bool(pointer_reset_state.get("enabled")),
-            reset_len=int(pointer_reset_state.get("reset_len") or 0),
-            p_active=float(pointer_reset_state.get("p_active") or 0.0),
-        ),
-        pointer_cfg=dict(
-            local_blocks=int(sb0.pointer_local_blocks),
-            half_blocks_max=int(sb0.pointer_half_blocks),
-            half_blocks_active=int(pointer_mask_state["half_blocks"]),
-            budget_blocks=int(sb0.pointer_budget_blocks),
-            budget_is_total=bool(sb0.pointer_budget_is_total),
-            budget_temp=float(sb0.pointer_budget_temp),
-            radius_mode=str(sb0.pointer_radius_mode),
-            global_blocks_max=int(sb0.pointer_global_blocks),
-            qblock_rep=str(sb0.pointer_qblock_rep),
-            doc_clamp=bool(sb0.pointer_doc_clamp),
-            budget_effective=budget_eff,
-            gumbel_topk=dict(
-                enabled=bool(sb0.gumbel_topk),
-                k=int(sb0.gumbel_topk_k),
-                tau=float(sb0.gumbel_topk_tau),
-            ),
-        ),
-        delta_star_max_active=(int(delta_star_max_state["max_tokens"]) if delta_star_max_state.get("max_tokens") is not None else None),
-        kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, min=kv_min, max=kv_max),
-        ptr_outside_local_frac=dict(mean=float(outside_fracs.mean().item()), min=float(outside_fracs.min().item()), max=float(outside_fracs.max().item())),
-        ptr_center_block0_frac=dict(mean=float(block0_fracs.mean().item()), min=float(block0_fracs.min().item()), max=float(block0_fracs.max().item())),
-        ptr_center_block0_frac_excl=dict(
-            mean=float(block0_excl_fracs.mean().item()),
-            min=float(block0_excl_fracs.min().item()),
-            max=float(block0_excl_fracs.max().item()),
-        ),
-        ptr_center_docstart_frac=dict(
-            mean=float(docstart_fracs.mean().item()),
-            min=float(docstart_fracs.min().item()),
-            max=float(docstart_fracs.max().item()),
-        ),
-        ptr_radius0_frac=dict(
-            mean=float(radius0_fracs.mean().item()),
-            min=float(radius0_fracs.min().item()),
-            max=float(radius0_fracs.max().item()),
-        ),
-        pi_entropy_mean=dict(mean=float(pi_entropies.mean().item()), min=float(pi_entropies.min().item()), max=float(pi_entropies.max().item())),
-        reg=dict(omega=reg_omega, entropy=reg_entropy, delta_edge=reg_delta_edge, zero_mean=reg_zero_mean, total=reg_total),
-        delta_tokens_hist=_to_frac_list(dt_hist, dt_total),
-        delta_blocks_hist=_to_frac_list(db_hist, db_total),
-        ptr_center_blocks_hist=_to_frac_list(pc_hist, pc_total),
-        ptr_radius_hist=_to_frac_list(pr_hist, pr_total),
-        ptr_extra_sum_hist=_to_frac_list(pe_hist, pe_total),
-    )
-    if teacher_loss_state.get("loss") is not None:
-        payload["teacher_loss"] = dict(
-            total=float(teacher_loss_state["loss"]),
-            cov=float(teacher_loss_state.get("cov") or 0.0),
-            budget=float(teacher_loss_state.get("budget") or 0.0),
-            nce=float(teacher_loss_state.get("nce") or 0.0),
-            step=int(teacher_loss_state.get("step") or 0),
-        )
-    if args.spectral_teacher:
-        every = int(args.spectral_teacher_every)
-        payload["teacher_every"] = every
-        payload["teacher_due"] = bool(every > 0 and (int(step) % every) == 0)
-        payload["teacher_call_count"] = int(teacher_stats_state.get("call_count") or 0)
-        last_call = teacher_stats_state.get("last_call_step")
-        payload["teacher_last_call_step"] = (int(last_call) if last_call is not None else -1)
-        last_ran = teacher_stats_state.get("step")
-        payload["teacher_last_ran_step"] = (int(last_ran) if last_ran is not None else -1)
-        payload["teacher_ran"] = bool(teacher_stats_state.get("teacher_ran"))
-        payload["teacher_skip_reason"] = str(teacher_stats_state.get("teacher_skip_reason") or "not_time")
-        payload["n_valid_q"] = int(teacher_stats_state.get("n_valid_q") or 0)   
-        payload["n_valid_blocks"] = int(teacher_stats_state.get("n_valid_blocks") or 0)
-        payload["n_pos"] = int(teacher_stats_state.get("n_pos") or 0)
-        payload["n_neg"] = int(teacher_stats_state.get("n_neg") or 0)
-        payload["teacher_nce_used"] = bool(teacher_stats_state.get("teacher_nce_used"))
-        payload["teacher_nce_pos_used"] = int(teacher_stats_state.get("teacher_nce_pos_used") or 0)
-        payload["teacher_nce_neg_used"] = int(teacher_stats_state.get("teacher_nce_neg_used") or 0)
-        payload["teacher_target_entropy"] = float(teacher_stats_state.get("teacher_target_entropy") or 0.0)
-        payload["teacher_top1_mass"] = float(teacher_stats_state.get("teacher_top1_mass") or 0.0)
-        payload["teacher_stats_step"] = payload["teacher_last_ran_step"]
-    print0(json.dumps(payload), console=True)
-
-def _block_masks_for_teacher(model: nn.Module, input_seq: Tensor, docs: Tensor, window_blocks: Tensor):
-    long_bm, short_bm = model.create_blockmasks(input_seq, window_blocks, docs=docs)
-    block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm,
-                   short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
-    if len(block_masks) != len(model.blocks):
-        raise ValueError(f"teacher block mask list len={len(block_masks)} != num_layers={len(model.blocks)}")
-    return block_masks
-
-def _select_teacher_heads(num_heads: int, device: torch.device) -> Tensor:      
-    n = int(args.spectral_teacher_heads)
-    if n <= 0 or n >= num_heads:
-        return torch.arange(num_heads, device=device)
-    return torch.arange(n, device=device)
-
-@contextlib.contextmanager
-def _teacher_disable_ctx():
-    if _dynamo is None:
-        yield
-        return
-    try:
-        ctx = _dynamo.disable()
-        if hasattr(ctx, "__enter__") and hasattr(ctx, "__exit__"):
-            with ctx:
-                yield
-                return
-    except Exception:
-        pass
-    yield
-
-def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) -> Tensor | None:
-    if not args.spectral_teacher:
-        return None
-    every = int(args.spectral_teacher_every)
-    teacher_stats_state["call_count"] = int(teacher_stats_state.get("call_count") or 0) + 1
-    teacher_stats_state["last_call_step"] = int(step)
-    if every <= 0 or (step % every) != 0:
-        teacher_stats_state.update(
-            teacher_ran=False,
-            teacher_skip_reason="not_time",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-        )
-        return None
-    if not spectral_bias_modules or not args.spectral_use_pointer_mask:
-        teacher_stats_state.update(
-            teacher_ran=False,
-            teacher_skip_reason="exception",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
-        teacher_loss_state["loss"] = None
-        return None
-
-    teacher_len = int(args.spectral_teacher_len)
-    if teacher_len <= 0:
-        teacher_stats_state.update(
-            teacher_ran=False,
-            teacher_skip_reason="no_valid_tokens",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
-        teacher_loss_state["loss"] = None
-        return None
-    if teacher_len > int(inputs.numel()):
-        teacher_len = int(inputs.numel())
-    teacher_len = teacher_len - (teacher_len % 128)
-    if teacher_len <= 0:
-        teacher_stats_state.update(
-            teacher_ran=False,
-            teacher_skip_reason="no_valid_tokens",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
-        teacher_loss_state["loss"] = None
-        return None
-
-    model_unwrapped = _unwrap_compiled(model)
-    layer_idx = int(args.spectral_teacher_layer)
-    if layer_idx < 0 or layer_idx >= len(model_unwrapped.blocks):
-        raise ValueError(f"SPECTRAL_TEACHER_LAYER={layer_idx} out of range for num_layers={len(model_unwrapped.blocks)}")
-
-    try:
-        with _teacher_disable_ctx():
-            device = inputs.device
-            input_seq = inputs[:teacher_len]
-            docs = (input_seq == 50256).cumsum(0)
-
-            # --- forward to the teacher layer (optionally with grad) ---
-            detach_backbone = bool(args.spectral_teacher_detach_backbone)
-            grad_ctx = torch.no_grad() if detach_backbone else contextlib.nullcontext()
-            with grad_ctx:
-                ve = [value_embed(input_seq) for value_embed in model_unwrapped.value_embeds]
-                ve = [ve[0], ve[1], ve[2]] + [None] * (len(model_unwrapped.blocks) - 6) + [ve[0], ve[1], ve[2]]
-                x = x0 = norm(model_unwrapped.embed(input_seq)[None])
-                skip_connections = []
-                n = len(model_unwrapped.skip_weights)
-                block_masks = _block_masks_for_teacher(model_unwrapped, input_seq, docs, window_blocks)
-                for i in range(layer_idx):
-                    if i >= n:
-                        x = x + model_unwrapped.skip_weights[i - n] * skip_connections.pop()
-                    x, _ = model_unwrapped.blocks[i](x, ve[i], x0, block_masks[i], docs)
-                    if i < n:
-                        skip_connections.append(x)
-
-                attn = model_unwrapped.blocks[layer_idx].attn
-                x_attn = norm(x)
-                q, k, _ = (
-                    F.linear(x_attn, attn.qkv_w.flatten(end_dim=1).type_as(x_attn))
-                    .view(1, teacher_len, 3 * attn.num_heads, attn.head_dim)
-                    .chunk(3, dim=-2)
-                )
-                q, k = norm(q), norm(k)
-                q_for_bias = q.transpose(1, 2)
-                q, k = attn.rotary(q), attn.rotary(k)
-
-        sb = attn.spectral_bias
-        if sb is None:
-            return None
-
-        # --- student parameters (grad only through SpectralBias) ---
-        dbg_prev = sb.debug_stats
-        sb.debug_stats = False
-        try:
-            (
-                coeff_cos,
-                coeff_sin,
-                slope,
-                _b0,
-                delta_star,
-                _pi,
-                budget_logits,
-                _delta_main,
-                _width,
-                cos_wD,
-                sin_wD,
-                _reg_loss,
-            ) = sb(q_for_bias.detach() if detach_backbone else q_for_bias, docs=docs)
-        finally:
-            sb.debug_stats = dbg_prev
-
-        # --- teacher dense attention (no grad) ---
-        with torch.no_grad():
-            q_bhtd = q.transpose(1, 2)  # [1,H,L,D]
-            k_bhtd = k.transpose(1, 2)
-            head_idx = _select_teacher_heads(attn.num_heads, device)
-            q_sel = q_bhtd[0, head_idx]  # [Hh,L,D]
-            k_sel = k_bhtd[0, head_idx]
-
-            use_slope = bool(sb.use_slope)
-            beta = float(sb.beta)
-            use_spectral = bool(args.spectral_bias)
-            if use_spectral:
-                K = int(sb.K)
-                cos_t = cos_wD.transpose(0, 1).to(dtype=torch.float32)  # [L,K]
-                sin_t = sin_wD.transpose(0, 1).to(dtype=torch.float32)  # [L,K]
-                cos_bhtk = cos_t[None, None].expand(1, attn.num_heads, teacher_len, K)
-                sin_bhtk = sin_t[None, None].expand(1, attn.num_heads, teacher_len, K)
-                Qcos = coeff_cos * cos_bhtk + coeff_sin * sin_bhtk
-                Qsin = coeff_cos * sin_bhtk - coeff_sin * cos_bhtk
-                q_pos = torch.cat([Qcos, Qsin], dim=-1)  # [1,H,L,2K]
-                k_pos = torch.cat([cos_bhtk, sin_bhtk], dim=-1)  # [1,H,L,2K]
-                if use_slope:
-                    pos = torch.arange(teacher_len, device=device, dtype=torch.float32)
-                    q_pos = torch.cat([q_pos, (-slope).unsqueeze(-1)], dim=-1)
-                    k_pos = torch.cat([k_pos, pos[None, None, :, None].expand(1, attn.num_heads, teacher_len, 1)], dim=-1)
-                s = math.sqrt(beta / float(attn.attn_scale))
-                q_pos = (q_pos * s).to(dtype=q_sel.dtype)
-                k_pos = (k_pos * s).to(dtype=k_sel.dtype)
-                q_pos = q_pos[0, head_idx]
-                k_pos = k_pos[0, head_idx]
-            else:
-                q_pos = None
-                k_pos = None
-
-            block_size = 128
-            num_blocks = teacher_len // block_size
-            k_idx = torch.arange(teacher_len, device=device, dtype=torch.int64)
-            k_blocks = torch.floor_divide(k_idx, block_size)
-            kb_idx = torch.arange(num_blocks, device=device, dtype=torch.int64)
-
-            teacher_mass = torch.zeros((q_sel.size(0), num_blocks, num_blocks), device=device, dtype=torch.float32)
-            for qb in range(num_blocks):
-                qs = qb * block_size
-                qe = qs + block_size
-                q_block = q_sel[:, qs:qe]
-                scores = torch.matmul(q_block, k_sel.transpose(-2, -1)) * float(attn.attn_scale)
-                if q_pos is not None and k_pos is not None:
-                    q_pos_block = q_pos[:, qs:qe]
-                    scores = scores + torch.matmul(q_pos_block, k_pos.transpose(-2, -1)) * float(attn.attn_scale)
-
-                q_idx = torch.arange(qs, qe, device=device, dtype=torch.int64)
-                docs_q = docs[qs:qe]
-                doc_mask = docs_q[:, None] == docs[None, :]
-                causal_mask = q_idx[:, None] >= k_idx[None, :]
-                mask = doc_mask & causal_mask
-                scores = scores.float().masked_fill(~mask, -1.0e9)
-                attn_w = torch.softmax(scores, dim=-1)
-                attn_sum = attn_w.sum(dim=1)
-                mass = torch.zeros((q_sel.size(0), num_blocks), device=device, dtype=torch.float32)
-                mass.scatter_add_(dim=1, index=k_blocks[None, :].expand(q_sel.size(0), -1), src=attn_sum)
-                teacher_mass[:, qb, :] = mass
-
-            # --- student inclusion probability (grad) ---
-            block_size = 128
-            num_blocks = teacher_len // block_size
-            q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int64)
-            t_rep = (q_blocks + 1) * block_size - 1
-            t_rep_l = t_rep.to(torch.long)
-            doc_change_tok = torch.ones((teacher_len,), device=device, dtype=torch.bool)
-            doc_change_tok[1:] = docs[1:] != docs[:-1]
-            tok_idx = torch.arange(teacher_len, device=device, dtype=torch.int64)
-            doc_start_token = torch.where(doc_change_tok, tok_idx, torch.zeros_like(tok_idx)).cummax(dim=0).values
-            doc_start_blk_ptr = torch.floor_divide(doc_start_token[t_rep_l], block_size).to(torch.int64)
-            block_start_tok = (q_blocks * int(block_size)).to(torch.long)
-            doc_start_blk_local = torch.floor_divide(doc_start_token[block_start_tok], block_size).to(torch.int64)
-
-        if sb.pointer_qblock_rep == "last":
-            delta_rep = delta_star[0, :, t_rep_l]
-            budget_rep = budget_logits[0, :, t_rep_l]
-        else:
-            delta_rep = delta_star[0].reshape(attn.num_heads, num_blocks, block_size, sb.M).mean(dim=2)
-            budget_rep = budget_logits[0].reshape(attn.num_heads, num_blocks, block_size, sb.M).mean(dim=2)
-
-        delta_rep = delta_rep[_select_teacher_heads(attn.num_heads, device)]
-        budget_rep = budget_rep[_select_teacher_heads(attn.num_heads, device)]
-        Hh = delta_rep.size(0)
-        M = int(sb.M)
-        local_blocks = min(int(sb.pointer_local_blocks), num_blocks)
-        ptr_half_active = int(sb._pointer_half_blocks_active.item())
-
-        budget_val = max(0, int(sb.pointer_budget_blocks))
-        ptr_half_cap = max(ptr_half_active, 0)
-        if sb.pointer_budget_is_total:
-            budget_total_req = budget_val
-            budget_total_cap = int(local_blocks + M + (2 * M * ptr_half_cap))
-            budget_total = min(int(budget_total_req), int(budget_total_cap))
-            budget_extra_blocks = max(int(budget_total) - int(local_blocks) - int(M), 0)
-            budget_target_nonlocal_blocks = max(int(budget_total) - int(local_blocks), 0)
-        else:
-            budget_extra_blocks = budget_val
-            budget_total = int(local_blocks + M + budget_extra_blocks)
-            budget_target_nonlocal_blocks = max(int(M + budget_extra_blocks), 0)
-        budget_rem = min(int(budget_extra_blocks) // 2, int(M * ptr_half_cap))
-        if budget_rem <= 0:
-            r_m = delta_rep.new_zeros(delta_rep.shape)
-        else:
-            temp = max(float(sb.pointer_budget_temp), 1e-6)
-            u = (budget_rep / temp).to(dtype=torch.float32)
-            rem = delta_rep.new_full((Hh, num_blocks), float(budget_rem), dtype=torch.float32)
-            alloc = delta_rep.new_zeros(delta_rep.shape, dtype=torch.float32)
-            for m in range(M - 1):
-                v = torch.sigmoid(u[..., m])
-                b = v * rem
-                alloc[..., m] = b
-                rem = rem - b
-            alloc[..., M - 1] = rem
-            r_m = torch.clamp(alloc, min=0.0, max=float(ptr_half_active))
-
-        key_tok = t_rep[None, :, None].to(delta_rep.dtype) - delta_rep
-        key_tok = key_tok.clamp(min=0.0)
-        center_blk = (key_tok / float(block_size)).to(dtype=torch.float32)
-        center_blk = torch.minimum(center_blk, q_blocks[None, :, None].to(center_blk.dtype))
-        if sb.pointer_doc_clamp:
-            center_blk = torch.maximum(center_blk, doc_start_blk_ptr[None, :, None].to(center_blk.dtype))
-
-        kb_idx = torch.arange(num_blocks, device=device, dtype=torch.float32)
-        kb_idx_i = kb_idx.to(torch.int64)
-        dist = (kb_idx[None, None, None, :] - center_blk[..., None]).abs()
-        temp_inc = max(float(args.spectral_teacher_temp), 1e-6)
-        p_m = torch.sigmoid((r_m[..., None] - dist) / temp_inc)
-        P = 1.0 - torch.prod(1.0 - p_m, dim=2)  # [Hh,QB,KB]
-
-        qb_idx = q_blocks[None, :, None].to(torch.int64)
-        local_start = (q_blocks - (local_blocks - 1)).clamp(min=0)
-        local_start = torch.maximum(local_start, doc_start_blk_local)
-        local_mask = (kb_idx_i[None, None, :] >= local_start[None, :, None]) & (kb_idx_i[None, None, :] <= qb_idx)
-
-        teacher_mass = teacher_mass[:, :num_blocks, :]
-        teacher_mass = teacher_mass.masked_fill(local_mask, 0.0)
-        t_sum = teacher_mass.sum(dim=-1, keepdim=True)
-        valid = (t_sum.squeeze(-1) > 0)
-        n_valid_q = int(valid.sum().item())
-        if n_valid_q <= 0:
-            teacher_stats_state.update(
-                teacher_ran=True,
-            teacher_skip_reason="no_valid_tokens",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
-        teacher_loss_state["loss"] = None
-        return None
-
-        t_norm = teacher_mass / (t_sum + 1.0e-9)
-        valid_k = (kb_idx_i[None, None, :] >= doc_start_blk_local[None, :, None]) & (kb_idx_i[None, None, :] <= qb_idx)
-        valid_k = valid_k & (~local_mask)
-        n_valid_blocks = int(valid_k.sum().item())
-        if n_valid_blocks <= 0:
-            teacher_stats_state.update(
-                teacher_ran=True,
-            teacher_skip_reason="no_valid_blocks",
-            n_valid_q=n_valid_q,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
-        teacher_loss_state["loss"] = None
-        return None
-
-        valid_denom = valid.float().sum().clamp_min(1.0)
-        t_norm_safe = t_norm.clamp_min(1.0e-9)
-        teacher_target_entropy = float((-(t_norm_safe * torch.log(t_norm_safe)).sum(dim=-1) * valid.float()).sum() / valid_denom)
-        teacher_top1_mass = float((t_norm.max(dim=-1).values * valid.float()).sum() / valid_denom)
-
-        cov = -(t_norm * torch.log(P + 1.0e-9)).sum(dim=-1)
-        cov = (cov * valid.float()).sum() / valid_denom
-
-        expected = (P * valid_k.float()).sum(dim=-1)
-        max_extra = max(num_blocks - local_blocks, 0)
-        target_extra = float(min(int(budget_target_nonlocal_blocks), int(max_extra)))
-        budget = (expected - target_extra).square()
-        budget = (budget * valid.float()).sum() / valid_denom
-
-        nce = torch.zeros((), device=device, dtype=torch.float32)
-        n_pos = 0
-        n_neg = 0
-        nce_used = False
-        nce_pos_used = 0
-        nce_neg_used = 0
-        skip_reason = "not_time"
-        if bool(args.spectral_teacher_nce):
-            pos_k_cfg = min(int(args.spectral_teacher_nce_pos), num_blocks)
-            neg_k_cfg = min(int(args.spectral_teacher_nce_neg), num_blocks)
-            if pos_k_cfg <= 0:
-                skip_reason = "no_pos"
-            elif neg_k_cfg <= 0:
-                skip_reason = "no_neg"
-            else:
-                valid_k_q = valid_k.squeeze(0).sum(dim=-1)
-                max_valid = int(valid_k_q.max().item()) if valid_k_q.numel() > 0 else 0
-                if max_valid <= 1:
-                    skip_reason = "no_neg"
-                else:
-                    pos_k = min(pos_k_cfg, max_valid)
-                    neg_k = min(neg_k_cfg, max_valid - pos_k)
-                    if neg_k <= 0 and max_valid > 1:
-                        pos_k = min(pos_k, max_valid - 1)
-                        neg_k = min(neg_k_cfg, max_valid - pos_k)
-                    if pos_k <= 0:
-                        skip_reason = "no_pos"
-                    elif neg_k <= 0:
-                        skip_reason = "no_neg"
-                    else:
-                        valid_k_h = valid_k.expand(Hh, -1, -1)
-                        nce_valid = valid & (valid_k_q[None, :] >= (pos_k + neg_k))
-                        if int(nce_valid.sum().item()) <= 0:
-                            skip_reason = "no_neg"
-                        else:
-                            mass_for_topk = teacher_mass.masked_fill(~valid_k_h, -1.0e9)
-                            pos_idx = torch.topk(mass_for_topk, k=pos_k, dim=-1).indices
-                            pos_valid = valid_k_h.gather(2, pos_idx)
-                            pos_mask_full = torch.zeros_like(valid_k_h, dtype=torch.bool)
-                            pos_mask_full.scatter_(2, pos_idx, pos_valid)
-
-                            gen = torch.Generator(device=device)
-                            gen.manual_seed(int(args.seed) + 1000003 * int(step) + 917)
-                            rand = torch.rand(mass_for_topk.shape, device=device, generator=gen)
-                            rand = rand.masked_fill(~valid_k_h, -1.0)
-                            rand = rand.masked_fill(pos_mask_full, -1.0)
-                            neg_idx = torch.topk(rand, k=neg_k, dim=-1).indices
-                            neg_valid = valid_k_h.gather(2, neg_idx)
-                            neg_valid = neg_valid & (~pos_mask_full.gather(2, neg_idx))
-
-                            pos_count = pos_valid.sum(dim=-1)
-                            neg_count = neg_valid.sum(dim=-1)
-                            nce_valid = nce_valid & (pos_count > 0) & (neg_count > 0)
-                            if int(nce_valid.sum().item()) <= 0:
-                                skip_reason = "no_neg"
-                            else:
-                                P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
-                                logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
-                                pos_scores = logits.gather(2, pos_idx)  # [Hh,QB,pos_k]
-                                neg_scores = logits.gather(2, neg_idx)  # [Hh,QB,neg_k]
-                                neg_scores = neg_scores.masked_fill(~neg_valid, -1.0e9)
-                                neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
-                                all_scores = torch.cat([pos_scores.unsqueeze(-1), neg_scores], dim=-1)
-                                denom = torch.logsumexp(all_scores, dim=-1)  # [Hh,QB,pos_k]
-                                loss_pos = (denom - pos_scores)  # [Hh,QB,pos_k]
-                                loss_pos = loss_pos.masked_fill(~pos_valid, 0.0)
-                                pos_count_f = pos_count.to(dtype=torch.float32).clamp_min(1.0)
-                                loss_hq = loss_pos.sum(dim=-1) / pos_count_f  # [Hh,QB]
-                                nce = loss_hq.masked_fill(~nce_valid, 0.0).sum() / nce_valid.float().sum().clamp_min(1.0)
-                                n_pos = int(pos_k)
-                                n_neg = int(neg_k)
-                                nce_used = True
-                                nce_pos_used = int(pos_k)
-                                nce_neg_used = int(neg_k)
-                                skip_reason = "not_time"
-        else:
-            skip_reason = "no_neg"
-
-        if not (torch.isfinite(cov) and torch.isfinite(budget) and torch.isfinite(nce)):
-            teacher_stats_state.update(
-                teacher_ran=True,
-                teacher_skip_reason="nonfinite",
-                n_valid_q=n_valid_q,
-                n_valid_blocks=n_valid_blocks,
-                n_pos=n_pos,
-                n_neg=n_neg,
-                teacher_nce_used=bool(nce_used),
-                teacher_nce_pos_used=int(nce_pos_used),
-                teacher_nce_neg_used=int(nce_neg_used),
-                teacher_target_entropy=teacher_target_entropy,
-                teacher_top1_mass=teacher_top1_mass,
-                step=int(step),
-            )
-            teacher_loss_state["loss"] = None
-            return None
-
-        teacher_stats_state.update(
-            teacher_ran=True,
-            teacher_skip_reason=skip_reason,
-            n_valid_q=n_valid_q,
-            n_valid_blocks=n_valid_blocks,
-            n_pos=n_pos,
-            n_neg=n_neg,
-            teacher_nce_used=bool(nce_used),
-            teacher_nce_pos_used=int(nce_pos_used),
-            teacher_nce_neg_used=int(nce_neg_used),
-            teacher_target_entropy=teacher_target_entropy,
-            teacher_top1_mass=teacher_top1_mass,
-            step=int(step),
-        )
-
-        loss = (
-            float(args.spectral_teacher_lambda_cov) * cov
-            + float(args.spectral_teacher_lambda_budget) * budget
-            + float(args.spectral_teacher_lambda_nce) * nce
-        )
-        teacher_loss_state["loss"] = float(loss.detach().item())
-        teacher_loss_state["cov"] = float(cov.detach().item())
-        teacher_loss_state["budget"] = float(budget.detach().item())
-        teacher_loss_state["nce"] = float(nce.detach().item())
-        teacher_loss_state["step"] = int(step)
-        return loss
-    except Exception:
-        teacher_stats_state.update(
-            teacher_ran=True,
-            teacher_skip_reason="exception",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_nce_used=False,
-            teacher_nce_pos_used=0,
-            teacher_nce_neg_used=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
-        teacher_loss_state["loss"] = None
-        return None
-
-compute_teacher_loss_nocompile = _dynamo.disable(compute_teacher_loss) if _dynamo is not None else compute_teacher_loss
-
-def _parse_csv_ints(s: str) -> list[int]:
-    parts = [p.strip() for p in str(s).split(",")]
-    out: list[int] = []
-    for p in parts:
-        if not p:
-            continue
-        out.append(int(p))
-    return out
-
-def maybe_run_needle_eval(*, step: int, window_blocks: Tensor, force: bool = False):
-    # Rank0-only synthetic NIAH eval (SPEC.md §8B). Uses the subset-logits path
-    # in `GPT.forward(..., logit_positions=...)` to avoid materializing [T,V].
-    if not args.needle_eval:
-        return
-    if not force:
-        every = int(args.needle_eval_every)
-        if every <= 0 or (step % every) != 0:
-            return
-
-    seq_len = int(args.needle_seq_len)
-    if seq_len % 128 != 0:
-        raise ValueError(f"NEEDLE_SEQ_LEN must be divisible by 128, got {seq_len}")
-    max_seq_len = int(max(args.train_seq_len, args.val_seq_len))
-    if seq_len > max_seq_len:
-        raise ValueError(f"NEEDLE_SEQ_LEN={seq_len} exceeds max_seq_len={max_seq_len} (set VAL_SEQ_LEN/TRAIN_SEQ_LEN higher)")
-
-    anchor_len = int(args.needle_anchor_len)
-    value_len = int(args.needle_value_len)
-    if anchor_len <= 0 or value_len <= 0:
-        raise ValueError("NEEDLE_ANCHOR_LEN and NEEDLE_VALUE_LEN must be > 0")
-
-    query_start = seq_len - (anchor_len + value_len)  # place query at end
-    min_dist = anchor_len + value_len + 1
-
-    distances = [d for d in _parse_csv_ints(args.needle_distances) if d >= min_dist and d <= query_start]
-    if not distances:
-        raise ValueError(
-            f"NEEDLE_DISTANCES produced no valid distances for seq_len={seq_len} (query_start={query_start}, min_dist={min_dist})"
-        )
-    samples = int(args.needle_samples_per_distance)
-    if samples <= 0:
-        raise ValueError("NEEDLE_SAMPLES_PER_DISTANCE must be > 0")
-
-    # Synchronize ranks so training doesn't proceed while rank0 runs eval.
-    dist.barrier()
-    if not master_process:
-        dist.barrier()
-        return
-
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-    eod_token_id = 50256
-    vocab_size = int(args.vocab_size)
-    if not (0 <= eod_token_id < vocab_size):
-        raise ValueError(f"EOD token id {eod_token_id} out of range for vocab_size={vocab_size}")
-
-    # Sample tokens from the vocab while excluding EOD (to avoid accidental doc boundaries).
-    vocab_no_eod = vocab_size - 1
-    def _rand_no_eod(shape: tuple[int, ...], *, generator: torch.Generator) -> Tensor:
-        t = torch.randint(0, vocab_no_eod, shape, device=device, dtype=torch.int32, generator=generator)
-        if eod_token_id != vocab_size - 1:
-            t = t + (t >= eod_token_id).to(dtype=t.dtype)
-        return t
-
-    results: dict[int, dict[str, float]] = {}
-    total_loss = 0.0
-    total_acc = 0.0
-    total_em = 0.0
-    total_n = 0
-
-    model.eval()
-    with torch.no_grad():
-        for dist_tokens in distances:
-            dist_tokens = int(dist_tokens)
-            needle_start = query_start - dist_tokens
-            # Sanity: ensure the two segments don't overlap.
-            if needle_start < 0 or (needle_start + anchor_len + value_len) >= query_start:
-                continue
-
-            sum_loss = 0.0
-            sum_acc = 0.0
-            sum_em = 0.0
-            for si in range(samples):
-                gen = torch.Generator(device=device)
-                gen.manual_seed(int(args.seed) + 1000003 * int(step) + 1009 * dist_tokens + si)
-
-                full = _rand_no_eod((seq_len + 1,), generator=gen)
-                anchor = _rand_no_eod((anchor_len,), generator=gen)
-                value = _rand_no_eod((value_len,), generator=gen)
-
-                full[needle_start : needle_start + anchor_len] = anchor
-                full[needle_start + anchor_len : needle_start + anchor_len + value_len] = value
-                full[query_start : query_start + anchor_len] = anchor
-                full[query_start + anchor_len : query_start + anchor_len + value_len] = value
-
-                input_seq = full[:-1]
-                targets = full[1:].to(torch.int64)
-                logit_pos0 = query_start + anchor_len - 1
-                logit_positions = torch.arange(logit_pos0, logit_pos0 + value_len, device=device, dtype=torch.long)
-
-                def _needle_fwd():
-                    return model(
-                        input_seq,
-                        targets,
-                        window_blocks,
-                        logit_positions=logit_positions,
-                        return_metrics=True,
-                    )
-
-                loss_t, acc_t, em_t = run_with_compile_fallback(_needle_fwd, where=f"needle_eval_step{step}")
-                sum_loss += float(loss_t.item())
-                sum_acc += float(acc_t.item())
-                sum_em += float(em_t.item())
-
-            denom = float(max(samples, 1))
-            results[dist_tokens] = dict(
-                dist_blocks=int(dist_tokens // 128),
-                loss=(sum_loss / denom),
-                ppl=float(math.exp(sum_loss / denom)),
-                token_acc=(sum_acc / denom),
-                exact_match=(sum_em / denom),
-            )
-            total_loss += sum_loss
-            total_acc += sum_acc
-            total_em += sum_em
-            total_n += samples
-
-    if total_n > 0:
-        overall = dict(
-            loss=float(total_loss / total_n),
-            ppl=float(math.exp(total_loss / total_n)),
-            token_acc=float(total_acc / total_n),
-            exact_match=float(total_em / total_n),
-        )
-    else:
-        overall = dict(loss=None, ppl=None, token_acc=None, exact_match=None)
-
-    payload = dict(
-        tag="NEEDLE_EVAL",
-        step=int(step),
-        seq_len=int(seq_len),
-        anchor_len=int(anchor_len),
-        value_len=int(value_len),
-        samples_per_distance=int(samples),
-        sliding_window_blocks=int(window_blocks.item()) if isinstance(window_blocks, Tensor) else None,
-        pointer_mask=dict(enabled=pointer_mask_state.get("enabled"), half_blocks=pointer_mask_state.get("half_blocks")),
-        results={str(k): v for k, v in results.items()},
-        overall=overall,
-    )
-    print0(json.dumps(payload), console=True)
-
-    dist.barrier()
 
 # collect the parameters to optimize
 spectral_params = [p for n, p in model.named_parameters() if "spectral_bias" in n]
@@ -2272,8 +708,6 @@ for opt in optimizers:
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
-    if args.num_iterations <= 0:
-        return 0.0
     x = step / args.num_iterations # progress in training
     assert 0 <= x < 1
     if x < 1 - args.cooldown_frac:
@@ -2286,117 +720,15 @@ def get_lr(step: int):
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 def get_window_size_blocks(step: int):
-    if args.num_iterations <= 0:
-        x = 1.0
-    else:
-        x = step / args.num_iterations # progress in training
-        assert 0 <= x <= 1
+    x = step / args.num_iterations # progress in training
+    assert 0 <= x <= 1
     # Linearly increase the block-wise sliding window size over training 128 -> 1792
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
 maybe_update_pointer_mask(0)
-maybe_update_pointer_reset(0)
-maybe_update_gumbel_seed(0)
-maybe_update_delta_star_max(0)
-maybe_update_delta_edge_eps(0)
-compile_enabled = bool(args.torch_compile)
-if compile_enabled:
-    try:
-        import torch._dynamo as _dynamo  # type: ignore[import-not-found]
-
-        _dynamo.config.verbose = bool(args.torch_dynamo_verbose)
-        _dynamo.config.suppress_errors = bool(args.torch_dynamo_suppress_errors)
-    except Exception as e:
-        print_rank(json.dumps(dict(tag="DYNAMO_CONFIG_ERROR", error=str(e))), console=True)
-
-    compile_mode = args.torch_compile_mode.strip()
-    if compile_mode.lower() in {"", "none"}:
-        compile_mode = None  # type: ignore[assignment]
-    print0(
-        json.dumps(
-            dict(
-                tag="TORCH_COMPILE_CFG",
-                enabled=True,
-                backend=args.torch_compile_backend,
-                mode=compile_mode,
-                fullgraph=bool(args.torch_compile_fullgraph),
-                dynamo_verbose=bool(args.torch_dynamo_verbose),
-                dynamo_suppress_errors=bool(args.torch_dynamo_suppress_errors),
-                fallback_to_eager=bool(args.torch_compile_fallback_to_eager),
-            )
-        ),
-        console=True,
-    )
-    model = torch.compile(
-        model,
-        dynamic=False,
-        backend=args.torch_compile_backend,
-        mode=compile_mode,
-        fullgraph=bool(args.torch_compile_fullgraph),
-    )
-else:
-    print0(json.dumps(dict(tag="TORCH_COMPILE_CFG", enabled=False)), console=True)
-
-def _unwrap_compiled(m: nn.Module) -> nn.Module:
-    return getattr(m, "_orig_mod", m)
-
-def _is_compiler_error(e: BaseException) -> bool:
-    try:
-        from torch._dynamo.exc import BackendCompilerFailed  # type: ignore[import-not-found]
-    except Exception:
-        BackendCompilerFailed = ()  # type: ignore[assignment]
-    try:
-        from torch._inductor.exc import InductorError  # type: ignore[import-not-found]
-    except Exception:
-        InductorError = ()  # type: ignore[assignment]
-    if isinstance(e, (BackendCompilerFailed, InductorError)):  # type: ignore[arg-type]
-        return True
-    msg = repr(e)
-    return any(s in msg for s in ("torch._dynamo", "torch._inductor", "triton", "InductorError", "BackendCompilerFailed"))
-
-def _log_exception(e: BaseException, *, where: str):
-    import traceback
-
-    payload = dict(
-        tag="EXCEPTION",
-        where=str(where),
-        rank=int(rank),
-        local_rank=int(os.environ.get("LOCAL_RANK", "0")),
-        world_size=int(world_size),
-        compile_enabled=bool(compile_enabled),
-        pointer_mask=dict(enabled=pointer_mask_state.get("enabled"), half_blocks=pointer_mask_state.get("half_blocks")),
-        error_type=type(e).__name__,
-        error=str(e),
-    )
-    print_rank(json.dumps(payload), console=True)
-    # Full traceback: rank-local file if enabled, otherwise best-effort to rank0.
-    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-    print_rank(tb, console=False)
-    if master_process:
-        print0(tb, console=True)
-    if torch.cuda.is_available():
-        mem = dict(
-            allocated=int(torch.cuda.memory_allocated() // (1024**2)),
-            reserved=int(torch.cuda.memory_reserved() // (1024**2)),
-            max_allocated=int(torch.cuda.max_memory_allocated() // (1024**2)),
-            max_reserved=int(torch.cuda.max_memory_reserved() // (1024**2)),
-        )
-        print_rank(json.dumps(dict(tag="CUDA_MEM_MIB", where=str(where), **mem)), console=True)
-
-def run_with_compile_fallback(fn, *, where: str):
-    global model, compile_enabled
-    try:
-        return fn()
-    except Exception as e:
-        _log_exception(e, where=where)
-        if compile_enabled and args.torch_compile_fallback_to_eager and _is_compiler_error(e):
-            model = _unwrap_compiled(model)
-            compile_enabled = False
-            print_rank(json.dumps(dict(tag="TORCH_COMPILE_FALLBACK", where=str(where))), console=True)
-            return fn()
-        raise
+model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
@@ -2404,19 +736,17 @@ def run_with_compile_fallback(fn, *, where: str):
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(_unwrap_compiled(model).state_dict()),
+initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    def _warmup_fwd_bwd():
-        model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    run_with_compile_fallback(_warmup_fwd_bwd, where="warmup_fwd_bwd")
+    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
-_unwrap_compiled(model).load_state_dict(initial_state["model"])
+model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del initial_state
@@ -2434,10 +764,6 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     maybe_update_pointer_mask(step)
-    maybe_update_pointer_reset(step)
-    maybe_update_gumbel_seed(step)
-    maybe_update_delta_star_max(step)
-    maybe_update_delta_edge_eps(step)
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
@@ -2445,81 +771,36 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        val_pointer_forced = False
-        val_reset_forced = False
-        prev_reset_state = None
-        if spectral_bias_modules and args.spectral_use_pointer_mask and args.spectral_pointer_val_force:
-            val_pointer_forced = True
-            hb = int(args.spectral_pointer_val_half_blocks)
-            if hb < 0:
-                hb = int(args.spectral_pointer_half_blocks)
-            for sb in spectral_bias_modules:
-                sb.set_pointer_mask_state(enabled=True, half_blocks=hb)
-            pointer_mask_state["enabled"] = True
-            pointer_mask_state["half_blocks"] = hb
-        if spectral_bias_modules and pointer_reset_state.get("enabled"):
-            val_reset_forced = True
-            prev_reset_state = dict(pointer_reset_state)
-            for sb in spectral_bias_modules:
-                sb.set_pointer_reset_state(enabled=False, reset_len=0)
-            pointer_reset_state["enabled"] = False
-            pointer_reset_state["p_active"] = 0.0
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
-        window_blocks = get_window_size_blocks(step)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                def _val_fwd():
-                    return model(inputs, targets, window_blocks)
-                val_loss += run_with_compile_fallback(_val_fwd, where=f"val_fwd_step{step}")
+                val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        maybe_run_needle_eval(step=step, window_blocks=window_blocks, force=last_step)
         model.train()
-        if val_pointer_forced:
-            maybe_update_pointer_mask(step)
-        if val_reset_forced and prev_reset_state is not None:
-            for sb in spectral_bias_modules:
-                sb.set_pointer_reset_state(
-                    enabled=bool(prev_reset_state.get("enabled")),
-                    reset_len=int(prev_reset_state.get("reset_len") or 0),
-                )
-            pointer_reset_state.update(prev_reset_state)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=int(step), code=code, model=model.state_dict())
-            if args.save_optimizers:
-                log["optimizers"] = [opt.state_dict() for opt in optimizers]
-            os.makedirs(f"{log_dir}/{run_id}", exist_ok=True)
-            ckpt_path = f"{log_dir}/{run_id}/state_step{step:06d}.pt"
-            torch.save(log, ckpt_path)
-            print0(json.dumps(dict(tag="CHECKPOINT_SAVED", path=str(ckpt_path), step=int(step))), console=True)
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    window_blocks = get_window_size_blocks(step)
-    def _train_fwd_bwd():
-        loss = model(inputs, targets, window_blocks)
-        # Teacher schedule uses the same 1-based "global step" convention as `SCOPE_STATS`.
-        teacher_loss = compute_teacher_loss_nocompile(step=step + 1, inputs=inputs, window_blocks=window_blocks)
-        if teacher_loss is not None:
-            loss = loss + teacher_loss
-        loss.backward()
-        return loss
-    train_loss = run_with_compile_fallback(_train_fwd_bwd, where=f"train_fwd_bwd_step{step}")
+    model(inputs, targets, get_window_size_blocks(step)).backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters
@@ -2537,8 +818,6 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
-    if args.scope_log_every > 0 and (step + 1) % args.scope_log_every == 0:
-        log_scope_stats(step=step + 1, train_loss=train_loss.detach(), sliding_window_blocks=int(window_blocks.item()))
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
