@@ -1,0 +1,11 @@
+fineweb10B/
+pylog124M/
+__pycache__/
+logs/
+.DS_Store
+logb.txt
+logsh200_cur.txt
+logsh200.txt
+morelogs.txt
+SPEC.md
+AGENTS.md
