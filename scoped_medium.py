@@ -5,6 +5,8 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
+import json
+import random
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -539,6 +541,7 @@ class Hyperparameters:
     # optimization
     num_iterations = 7050 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    seed = 1337 # for reproducible ablations
     # architecture
     vocab_size = 50257
     # SCOPE: spectral bias (see SPEC.md)
@@ -572,8 +575,56 @@ class Hyperparameters:
     spectral_lambda_entropy = 1e-4
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    scope_log_every = 200 # rank0-only SCOPE debug stats
     save_checkpoint = False
 args = Hyperparameters()
+
+def _env_str(key: str, default: str) -> str:
+    v = os.environ.get(key)
+    return default if v is None else str(v)
+
+def _env_int(key: str, default: int) -> int:
+    v = os.environ.get(key)
+    return default if v is None else int(v)
+
+def _env_float(key: str, default: float) -> float:
+    v = os.environ.get(key)
+    return default if v is None else float(v)
+
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid boolean env var {key}={v!r}")
+
+# Lightweight env overrides (for ablations / Vast.ai runs).
+args.train_files = _env_str("TRAIN_FILES", args.train_files)
+args.val_files = _env_str("VAL_FILES", args.val_files)
+args.val_tokens = _env_int("VAL_TOKENS", args.val_tokens)
+args.train_seq_len = _env_int("TRAIN_SEQ_LEN", args.train_seq_len)
+args.val_seq_len = _env_int("VAL_SEQ_LEN", args.val_seq_len)
+args.num_iterations = _env_int("NUM_ITERATIONS", args.num_iterations)
+args.val_loss_every = _env_int("VAL_LOSS_EVERY", args.val_loss_every)
+args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)
+args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint)
+args.cooldown_frac = _env_float("COOLDOWN_FRAC", args.cooldown_frac)
+args.seed = _env_int("SEED", args.seed)
+
+# SCOPE toggles/knobs.
+args.spectral_bias = _env_bool("SPECTRAL_BIAS", args.spectral_bias)
+args.spectral_use_pointer_mask = _env_bool("SPECTRAL_USE_POINTER_MASK", args.spectral_use_pointer_mask)
+args.spectral_pointer_schedule = _env_bool("SPECTRAL_POINTER_SCHEDULE", args.spectral_pointer_schedule)
+args.spectral_pointer_schedule_disable_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_DISABLE_STEPS", args.spectral_pointer_schedule_disable_steps)
+args.spectral_pointer_schedule_mid_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_MID_STEPS", args.spectral_pointer_schedule_mid_steps)
+args.spectral_pointer_schedule_half_blocks_mid = _env_int("SPECTRAL_POINTER_SCHEDULE_HALF_BLOCKS_MID", args.spectral_pointer_schedule_half_blocks_mid)
+args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
+args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
+args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -586,12 +637,23 @@ dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
+# Deterministic init across ablation runs (rank0 params are broadcast anyway).
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+random.seed(args.seed)
+import numpy as np
+np.random.seed(args.seed)
+
 # begin logging
 logfile = None
 if master_process:
-    run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    log_dir = os.environ.get("LOG_DIR", "logs")
+    run_name = os.environ.get("RUN_NAME", "").strip()
+    run_uuid = uuid.uuid4()
+    run_prefix = f"{run_name}_" if run_name else ""
+    run_id = f"{run_prefix}{run_uuid}"
+    os.makedirs(log_dir, exist_ok=True)
+    logfile = f"{log_dir}/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -643,6 +705,7 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
                            lambda_omega=args.spectral_lambda_omega,
                            lambda_zero_mean=args.spectral_lambda_zero_mean,
                            lambda_entropy=args.spectral_lambda_entropy,
+                           debug_stats=master_process,
                        )).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
@@ -656,6 +719,20 @@ if args.spectral_bias:
         sb = getattr(m, "spectral_bias", None)
         if sb is not None:
             spectral_bias_modules.append(sb)
+if master_process and spectral_bias_modules:
+    sb0 = spectral_bias_modules[0]
+    print0(
+        json.dumps(
+            dict(
+                tag="SCOPE_BINS",
+                delta_tokens_edges=sb0._dbg_token_edges.tolist(),
+                delta_blocks_edges=sb0._dbg_block_edges.tolist(),
+                ptr_center_blocks_edges=sb0._dbg_block_edges.tolist(),
+                kv_unique_blocks_max=int(sb0._dbg_kv_unique_hist.numel() - 1),
+            )
+        ),
+        console=True,
+    )
 pointer_mask_state = dict(enabled=None, half_blocks=None)
 def maybe_update_pointer_mask(step: int):
     if not spectral_bias_modules:
@@ -681,6 +758,82 @@ def maybe_update_pointer_mask(step: int):
         sb.set_pointer_mask_state(enabled=enabled, half_blocks=half_blocks)
     pointer_mask_state["enabled"] = enabled
     pointer_mask_state["half_blocks"] = half_blocks
+
+def _hist_percentile(hist: Tensor, q: float) -> int | None:
+    total = int(hist.sum().item())
+    if total <= 0:
+        return None
+    cdf = hist.cumsum(0)
+    target = q * total
+    idx = int((cdf >= target).nonzero(as_tuple=False)[0].item())
+    return idx
+
+def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_window_blocks: int | None = None):
+    if not master_process:
+        return
+    if not spectral_bias_modules:
+        return
+    if args.scope_log_every <= 0:
+        return
+
+    sbs = spectral_bias_modules
+    sb0 = sbs[0]
+
+    kv_hist = sum((sb._dbg_kv_unique_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_kv_unique_hist))
+    kv_total = int(kv_hist.sum().item())
+    if kv_total > 0:
+        ks = torch.arange(kv_hist.numel(), device=kv_hist.device, dtype=torch.float32)
+        kv_mean = float((ks * kv_hist.float()).sum().item() / kv_total)
+        kv_p50 = _hist_percentile(kv_hist, 0.50)
+        kv_p90 = _hist_percentile(kv_hist, 0.90)
+        kv_max = int(torch.nonzero(kv_hist, as_tuple=False).max().item())
+    else:
+        kv_mean, kv_p50, kv_p90, kv_max = None, None, None, None
+
+    dt_hist = sum((sb._dbg_delta_tokens_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_tokens_hist))
+    db_hist = sum((sb._dbg_delta_blocks_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_blocks_hist))
+    pc_hist = sum((sb._dbg_ptr_center_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_center_hist))
+
+    dt_total = int(dt_hist.sum().item())
+    db_total = int(db_hist.sum().item())
+    pc_total = int(pc_hist.sum().item())
+
+    def _to_frac_list(hist: Tensor, total: int) -> list[float]:
+        if total <= 0:
+            return []
+        return (hist.float() / float(total)).tolist()
+
+    outside_fracs = torch.stack([sb._dbg_ptr_outside_local_frac for sb in sbs]).float()
+    block0_fracs = torch.stack([sb._dbg_ptr_block0_frac for sb in sbs]).float()
+    pi_entropies = torch.stack([sb._dbg_pi_entropy_mean for sb in sbs]).float()
+
+    reg_omega = float(torch.stack([sb._dbg_reg_omega for sb in sbs]).sum().item())
+    reg_entropy = float(torch.stack([sb._dbg_reg_entropy for sb in sbs]).sum().item())
+    reg_zero_mean = float(torch.stack([sb._dbg_reg_zero_mean for sb in sbs]).sum().item())
+    reg_total = float(torch.stack([sb._dbg_reg_total for sb in sbs]).sum().item())
+
+    payload = dict(
+        tag="SCOPE_STATS",
+        step=int(step),
+        train_loss=(float(train_loss.item()) if train_loss is not None else None),
+        sliding_window_blocks=int(sliding_window_blocks) if sliding_window_blocks is not None else None,
+        pointer_mask=dict(enabled=bool(pointer_mask_state["enabled"]), half_blocks=int(pointer_mask_state["half_blocks"])),
+        pointer_cfg=dict(
+            local_blocks=int(sb0.pointer_local_blocks),
+            half_blocks_max=int(sb0.pointer_half_blocks),
+            global_blocks=int(sb0.pointer_global_blocks),
+            qblock_rep=str(sb0.pointer_qblock_rep),
+        ),
+        kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, max=kv_max),
+        ptr_outside_local_frac=dict(mean=float(outside_fracs.mean().item()), min=float(outside_fracs.min().item()), max=float(outside_fracs.max().item())),
+        ptr_center_block0_frac=dict(mean=float(block0_fracs.mean().item()), min=float(block0_fracs.min().item()), max=float(block0_fracs.max().item())),
+        pi_entropy_mean=dict(mean=float(pi_entropies.mean().item()), min=float(pi_entropies.min().item()), max=float(pi_entropies.max().item())),
+        reg=dict(omega=reg_omega, entropy=reg_entropy, zero_mean=reg_zero_mean, total=reg_total),
+        delta_tokens_hist=_to_frac_list(dt_hist, dt_total),
+        delta_blocks_hist=_to_frac_list(db_hist, db_total),
+        ptr_center_blocks_hist=_to_frac_list(pc_hist, pc_total),
+    )
+    print0(json.dumps(payload), console=True)
 
 # collect the parameters to optimize
 spectral_params = [p for n, p in model.named_parameters() if "spectral_bias" in n]
@@ -793,14 +946,16 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"{log_dir}/{run_id}", exist_ok=True)
+            torch.save(log, f"{log_dir}/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    window_blocks = get_window_size_blocks(step)
+    train_loss = model(inputs, targets, window_blocks)
+    train_loss.backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters
@@ -818,6 +973,8 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if args.scope_log_every > 0 and (step + 1) % args.scope_log_every == 0:
+        log_scope_stats(step=step + 1, train_loss=train_loss.detach(), sliding_window_blocks=int(window_blocks.item()))
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

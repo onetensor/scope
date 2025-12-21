@@ -41,6 +41,8 @@ class SpectralBiasConfig:
     pointer_half_blocks: int = 4
     pointer_global_blocks: int = 0
     pointer_qblock_rep: str = "last"  # "last"|"mean"
+    # debug/telemetry (rank0 recommended)
+    debug_stats: bool = False
 
 
 class SpectralBias(nn.Module):
@@ -82,6 +84,7 @@ class SpectralBias(nn.Module):
         lambda_omega: float = 1e-5,
         lambda_zero_mean: float = 1e-4,
         lambda_entropy: float = 1e-4,
+        debug_stats: bool = False,
         enabled: bool = True,
     ):
         super().__init__()
@@ -119,6 +122,7 @@ class SpectralBias(nn.Module):
         self.pointer_qblock_rep = str(pointer_qblock_rep)
         if self.pointer_qblock_rep not in {"last", "mean"}:
             raise ValueError("pointer_qblock_rep must be one of: last|mean")
+        self.debug_stats = bool(debug_stats)
         self.register_buffer(
             "_pointer_mask_active",
             torch.tensor(1 if self.use_pointer_mask else 0, dtype=torch.int32),
@@ -151,6 +155,27 @@ class SpectralBias(nn.Module):
         self.register_buffer("_sin_wD", torch.empty(0, dtype=torch.float32), persistent=False)
         self.register_buffer("_cos_mean", torch.empty(0, dtype=torch.float32), persistent=False)
         self.register_buffer("_sin_mean", torch.empty(0, dtype=torch.float32), persistent=False)
+
+        # ---- SCOPE debug stats (rank0 recommended) ----
+        token_edges = torch.tensor(
+            [0, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535, 131071, 262143, 524287, 1048575],
+            dtype=torch.int64,
+        )
+        block_edges = torch.tensor([0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191], dtype=torch.int64)
+        self.register_buffer("_dbg_token_edges", token_edges, persistent=False)
+        self.register_buffer("_dbg_block_edges", block_edges, persistent=False)
+        self.register_buffer("_dbg_delta_tokens_hist", torch.zeros(token_edges.numel() + 1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_dbg_delta_blocks_hist", torch.zeros(block_edges.numel() + 1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_dbg_ptr_center_hist", torch.zeros(block_edges.numel() + 1, dtype=torch.int32), persistent=False)
+        max_kv = int(self.pointer_local_blocks + (2 * self.pointer_half_blocks + 1) * self.M + self.pointer_global_blocks)
+        self.register_buffer("_dbg_kv_unique_hist", torch.zeros(max_kv + 1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_dbg_ptr_outside_local_frac", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_ptr_block0_frac", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_pi_entropy_mean", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_reg_omega", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_reg_entropy", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_reg_zero_mean", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_reg_total", torch.zeros((), dtype=torch.float32), persistent=False)
 
         hidden = max(128, 2 * head_dim)
         out = 4 * M + (1 if use_slope else 0)  # Δ*, μ, σ, π_logit, (optional) slope
@@ -317,21 +342,72 @@ class SpectralBias(nn.Module):
         width = self.width_min + (self.width_max - self.width_min) * torch.sigmoid(mu.mean(dim=-1))  # [B,H,L]
 
         # Regularizers (only during training).
-        reg_loss = q.new_zeros((), dtype=torch.float32)
+        reg_omega = q.new_zeros((), dtype=torch.float32)
+        reg_entropy = q.new_zeros((), dtype=torch.float32)
+        reg_zero_mean = q.new_zeros((), dtype=torch.float32)
         if self.training:
             if self.lambda_omega > 0:
                 omega_sq = self.omega_sq.to(device=device).view(1, 1, 1, 1, K)
-                reg_loss = reg_loss + self.lambda_omega * (omega_sq * a_mk.square()).sum(dim=-1).mean()
+                reg_omega = self.lambda_omega * (omega_sq * a_mk.square()).sum(dim=-1).mean()
             if self.lambda_entropy > 0:
                 entropy = -(pi * (pi + self.eps).log()).sum(dim=-1)  # [B,H,L]
-                reg_loss = reg_loss + self.lambda_entropy * (math.log(M) - entropy).mean()
+                reg_entropy = self.lambda_entropy * (math.log(M) - entropy).mean()
             if self.lambda_zero_mean > 0:
                 # mean_Δ b(Δ) using trig means (ignoring optional gate for now)
                 cos_mean = cos_mean.to(device=device)  # [K]
                 sin_mean = sin_mean.to(device=device)  # [K]
                 mean_delta = 0.5 * float(L - 1)
                 mean_b = (coeff_cos * cos_mean).sum(dim=-1) + (coeff_sin * sin_mean).sum(dim=-1) + slope * mean_delta - b0
-                reg_loss = reg_loss + self.lambda_zero_mean * mean_b.mean().square()
+                reg_zero_mean = self.lambda_zero_mean * mean_b.mean().square()
+
+        reg_loss = reg_omega + reg_entropy + reg_zero_mean
+
+        if self.debug_stats:
+            # Representative pointer stats per query-block.
+            block_size = 128
+            if B == 1 and L % block_size == 0:
+                num_blocks = L // block_size
+                q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int64)
+                t_rep = (q_blocks + 1) * block_size - 1
+                if self.pointer_qblock_rep == "last":
+                    delta_rep = delta_star[0, :, t_rep, :]  # [H,QB,M]
+                    pi_rep = pi[0, :, t_rep, :]  # [H,QB,M]
+                else:
+                    delta_rep = delta_star[0].reshape(H, num_blocks, block_size, M).mean(dim=2)  # [H,QB,M]
+                    pi_rep = pi[0].reshape(H, num_blocks, block_size, M).mean(dim=2)  # [H,QB,M]
+
+                delta_tok_i = delta_rep.to(torch.int64)
+                dt_idx = torch.bucketize(delta_tok_i.flatten(), self._dbg_token_edges, right=False)
+                dt_hist = torch.bincount(dt_idx, minlength=self._dbg_delta_tokens_hist.numel()).to(torch.int32)
+                self._dbg_delta_tokens_hist.copy_(dt_hist)
+
+                delta_blk = torch.floor_divide(delta_tok_i, block_size)
+                db_idx = torch.bucketize(delta_blk.flatten(), self._dbg_block_edges, right=False)
+                db_hist = torch.bincount(db_idx, minlength=self._dbg_delta_blocks_hist.numel()).to(torch.int32)
+                self._dbg_delta_blocks_hist.copy_(db_hist)
+
+                key_tok = t_rep[None, :, None].to(delta_rep.dtype) - delta_rep
+                key_tok = key_tok.clamp(min=0.0)
+                ptr_center_blk = torch.floor_divide(key_tok.to(torch.int64), block_size)
+                ptr_center_blk = torch.minimum(ptr_center_blk, q_blocks[None, :, None])
+
+                pc_idx = torch.bucketize(ptr_center_blk.flatten(), self._dbg_block_edges, right=False)
+                pc_hist = torch.bincount(pc_idx, minlength=self._dbg_ptr_center_hist.numel()).to(torch.int32)
+                self._dbg_ptr_center_hist.copy_(pc_hist)
+
+                local_blocks = min(self.pointer_local_blocks, num_blocks)
+                local_start = (q_blocks - (local_blocks - 1)).clamp(min=0)
+                outside = ptr_center_blk < local_start[None, :, None]
+                self._dbg_ptr_outside_local_frac.copy_(outside.float().mean())
+                self._dbg_ptr_block0_frac.copy_((ptr_center_blk == 0).float().mean())
+
+                entropy = -(pi_rep * (pi_rep + self.eps).log()).sum(dim=-1)  # [H,QB]
+                self._dbg_pi_entropy_mean.copy_(entropy.mean())
+
+            self._dbg_reg_omega.copy_(reg_omega.detach())
+            self._dbg_reg_entropy.copy_(reg_entropy.detach())
+            self._dbg_reg_zero_mean.copy_(reg_zero_mean.detach())
+            self._dbg_reg_total.copy_(reg_loss.detach())
 
         return (
             coeff_cos,
@@ -458,6 +534,10 @@ class SpectralBias(nn.Module):
         key = (~keep).to(torch.int32) * big + kv_sorted
         _, order = key.sort(dim=-1)
         kv_packed = kv_sorted.gather(dim=-1, index=order)
+
+        if self.debug_stats:
+            kv_hist = torch.bincount(kv_num_blocks.flatten().to(torch.int64), minlength=self._dbg_kv_unique_hist.numel())
+            self._dbg_kv_unique_hist.copy_(kv_hist.to(torch.int32))
 
         kv_indices = kv_packed[None].contiguous().to(torch.int32)  # [1,H,QB,max_kv]
         kv_num_blocks = kv_num_blocks[None].contiguous()  # [1,H,QB]
