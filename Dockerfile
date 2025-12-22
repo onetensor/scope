@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv python-is-python3 \
+    python3 python3-pip python3-venv python-is-python3 python3-dev\
     git curl ca-certificates \
     build-essential ninja-build \
     && rm -rf /var/lib/apt/lists/*
