@@ -317,6 +317,7 @@ class CausalSelfAttention(nn.Module):
             gate_kind = self.spectral_bias.gate_kind
             ramp_lambda = float(self.spectral_bias.ramp_lambda)
             tau = float(self.spectral_bias.tau)
+            K = int(self.spectral_bias.K)
 
             if self.spectral_bias.use_pointer_mask:
                 block_mask = self.spectral_bias.build_pointer_blockmask(
@@ -326,31 +327,37 @@ class CausalSelfAttention(nn.Module):
                 )
 
             def score_mod(score, b, h, q_idx, kv_idx):
-                # FlexAttention may pass scalar or broadcastable index tensors; keep everything elementwise.
-                q_i = q_idx.to(torch.long)
-                k_i = kv_idx.to(torch.long)
-                delta = (q_i - k_i).clamp(min=0, max=T - 1)  # same shape as `score` (broadcasted)
-                # Lookup cos/sin(w * Δ) without materializing [T,T].
-                cos = cos_wD.T[delta]  # [..., K]
-                sin = sin_wD.T[delta]  # [..., K]
-                A = coeff_cos[b, h, q_i]  # [..., K]
-                Bc = coeff_sin[b, h, q_i]  # [..., K]
-                bias = (A * cos).sum(dim=-1) + (Bc * sin).sum(dim=-1)  # [...]
+                # FlexAttention may call score_mod with scalar indices during fake/compile; normalize to 1-D.
+                q = q_idx.to(torch.long).reshape(-1)  # [Q]
+                k = kv_idx.to(torch.long).reshape(-1)  # [Kv]
+                # NOTE: max clamp is unnecessary for valid token indices (0..T-1) and
+                # adds extra work / temporaries during compilation.
+                delta = (q[:, None] - k[None, :]).clamp(min=0)  # [Q,Kv]
+
+                A = coeff_cos[b, h, q]  # [Q,K]
+                Bc = coeff_sin[b, h, q]  # [Q,K]
+
+                # Accumulate per-frequency to avoid materializing [Q,Kv,K] intermediates (shared-mem blowups).
+                bias = score.new_zeros(delta.shape, dtype=torch.float32)
+                for kk in range(K):
+                    bias = bias + A[:, kk : kk + 1] * cos_wD[kk, delta] + Bc[:, kk : kk + 1] * sin_wD[kk, delta]
+
+                delta_f = delta.to(dtype=bias.dtype)
                 if subtract_b0:
-                    bias = bias - b0[b, h, q_i]
+                    bias = bias - b0[b, h, q][:, None]
                 if use_slope:
-                    bias = bias + slope[b, h, q_i] * delta.to(dtype=bias.dtype)
+                    bias = bias + slope[b, h, q][:, None] * delta_f
                 if gate_kind != "none" and ramp_lambda > 0:
-                    dm = delta_main[b, h, q_i]
-                    w = width[b, h, q_i]
-                    x = (delta.to(dtype=bias.dtype) - dm).abs()
+                    dm = delta_main[b, h, q][:, None]
+                    w = width[b, h, q][:, None]
+                    x = (delta_f - dm).abs()
                     x = (x - w) / tau
                     if gate_kind == "relu":
                         bias = bias - ramp_lambda * torch.relu(x)
                     else:
                         bias = bias - ramp_lambda * F.softplus(x)
-                # Ensure output has the same shape as `score` (important for fake tracing).
-                bias = bias + score.to(dtype=bias.dtype) * 0
+
+                bias = bias.reshape_as(score)
                 return score + beta * bias.to(dtype=score.dtype)
 
             y = flex_attention(
@@ -580,6 +587,9 @@ class Hyperparameters:
     spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2
+    # Validation override for pointer mask (default: use scheduled state).
+    spectral_pointer_val_force = False
+    spectral_pointer_val_half_blocks = -1  # <0 -> use spectral_pointer_half_blocks
     spectral_lambda_omega = 1e-5
     spectral_lambda_zero_mean = 1e-4
     spectral_lambda_entropy = 1e-4
@@ -632,6 +642,8 @@ args.spectral_pointer_schedule = _env_bool("SPECTRAL_POINTER_SCHEDULE", args.spe
 args.spectral_pointer_schedule_disable_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_DISABLE_STEPS", args.spectral_pointer_schedule_disable_steps)
 args.spectral_pointer_schedule_mid_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_MID_STEPS", args.spectral_pointer_schedule_mid_steps)
 args.spectral_pointer_schedule_half_blocks_mid = _env_int("SPECTRAL_POINTER_SCHEDULE_HALF_BLOCKS_MID", args.spectral_pointer_schedule_half_blocks_mid)
+args.spectral_pointer_val_force = _env_bool("SPECTRAL_POINTER_VAL_FORCE", args.spectral_pointer_val_force)
+args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOCKS", args.spectral_pointer_val_half_blocks)
 args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
 args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
@@ -934,6 +946,16 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        val_pointer_forced = False
+        if spectral_bias_modules and args.spectral_use_pointer_mask and args.spectral_pointer_val_force:
+            val_pointer_forced = True
+            hb = int(args.spectral_pointer_val_half_blocks)
+            if hb < 0:
+                hb = int(args.spectral_pointer_half_blocks)
+            for sb in spectral_bias_modules:
+                sb.set_pointer_mask_state(enabled=True, half_blocks=hb)
+            pointer_mask_state["enabled"] = True
+            pointer_mask_state["half_blocks"] = hb
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
@@ -949,6 +971,8 @@ for step in range(train_steps + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
+        if val_pointer_forced:
+            maybe_update_pointer_mask(step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()

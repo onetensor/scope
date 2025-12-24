@@ -151,8 +151,9 @@ class SpectralBias(nn.Module):
         self.register_buffer("logw_max", torch.tensor(math.log(w_max), dtype=torch.float32), persistent=False)
 
         # Trig caches for distances 0..L-1 (lazily initialized on-device).
-        self.register_buffer("_cos_wD", torch.empty(0, dtype=torch.float32), persistent=False)
-        self.register_buffer("_sin_wD", torch.empty(0, dtype=torch.float32), persistent=False)
+        # Keep these in bf16 to reduce memory/register pressure inside FlexAttention score_mod.
+        self.register_buffer("_cos_wD", torch.empty(0, dtype=torch.bfloat16), persistent=False)
+        self.register_buffer("_sin_wD", torch.empty(0, dtype=torch.bfloat16), persistent=False)
         self.register_buffer("_cos_mean", torch.empty(0, dtype=torch.float32), persistent=False)
         self.register_buffer("_sin_mean", torch.empty(0, dtype=torch.float32), persistent=False)
 
@@ -230,12 +231,14 @@ class SpectralBias(nn.Module):
 
         D = torch.arange(L, device=device, dtype=torch.float32)
         w = self.omegas.to(device=device)
-        cos_wD = torch.cos(w[:, None] * D[None, :])
-        sin_wD = torch.sin(w[:, None] * D[None, :])
+        cos_wD_f32 = torch.cos(w[:, None] * D[None, :])
+        sin_wD_f32 = torch.sin(w[:, None] * D[None, :])
+        self._cos_mean = cos_wD_f32.mean(dim=-1)
+        self._sin_mean = sin_wD_f32.mean(dim=-1)
+        cos_wD = cos_wD_f32.to(dtype=torch.bfloat16)
+        sin_wD = sin_wD_f32.to(dtype=torch.bfloat16)
         self._cos_wD = cos_wD
         self._sin_wD = sin_wD
-        self._cos_mean = cos_wD.mean(dim=-1)
-        self._sin_mean = sin_wD.mean(dim=-1)
         return cos_wD, sin_wD, self._cos_mean, self._sin_mean
 
     def set_pointer_mask_state(self, *, enabled: bool, half_blocks: int):
