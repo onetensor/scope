@@ -1,6 +1,8 @@
 # Agent Notes (SCOPE)
 
-This repo is the SCOPE research codebase (flattened; no nested repos).
+This workspace contains a nested training repo in `modded-nanogpt/` (it also has its own `.git/`).
+Unless a task explicitly says otherwise, treat `modded-nanogpt/` as the primary codebase for model
+training + experiments.
 
 ## Project Goal
 
@@ -14,20 +16,20 @@ Core ideas:
 - A **pointer-driven block-sparse KV mask** so far keys enter attention compute during training
   (union of local band + pointer windows + optional global anchors).
 
-`SPEC.md` is the source-of-truth spec.
+`modded-nanogpt/SPEC.md` is the source-of-truth spec.
 
 ## Source Of Truth / Do-Not-Edit
 
-- `SPEC.md`: most recent patch/change project specification.
-- `baseline.py`: frozen snapshot for ablations (do not modify).
+- `modded-nanogpt/SPEC.md`: full project specification.
+- `modded-nanogpt/baseline.py`: frozen snapshot for ablations (do not modify).
 
 ## Repo Map (key files)
 
-- `scoped_medium.py`: end-to-end training script (model + data + DDP + training loop).
-- `model/attn_bias.py`: `SpectralBias` implementation + pointer `BlockMask` builder + telemetry buffers.
-- `run_ablations.sh`: A/B/C ablation harness.
-- `Dockerfile`: container build for Vast.ai.
-- `.github/workflows/ghcr.yml`: GHCR build/push workflow.
+- `modded-nanogpt/scoped_medium.py`: end-to-end training script (model + data + DDP + training loop).
+- `modded-nanogpt/model/attn_bias.py`: `SpectralBias` implementation + pointer `BlockMask` builder + telemetry buffers.
+- `modded-nanogpt/run_ablations.sh`: A/B/C ablation harness.
+- `modded-nanogpt/Dockerfile`: container build for Vast.ai.
+- `modded-nanogpt/.github/workflows/ghcr.yml`: GHCR build/push workflow.
 
 ## SCOPE Controls (env vars)
 
@@ -35,59 +37,11 @@ Primary toggles used by `run_ablations.sh`:
 
 - `SPECTRAL_BIAS=0|1`
 - `SPECTRAL_IMPL=qk_aug|score_mod`
-- `SPECTRAL_QK_AUG_ALIGN=16`
 - `SPECTRAL_USE_POINTER_MASK=0|1`
-- `SPECTRAL_POINTER_SCHEDULE=0|1` (default: `0`)
+- `SPECTRAL_POINTER_SCHEDULE=0|1`
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
-- `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this total pointer KV budget: local + centers + extra)
-- `SPECTRAL_POINTER_BUDGET_IS_TOTAL=0|1` (compatibility switch; `0` treats budget as extra-only)
-- `SPECTRAL_POINTER_BUDGET_TEMP=<float>` (temperature for budget stick-breaking)
-- `SPECTRAL_POINTER_RADIUS_MODE=fixed|pi`
-- `SPECTRAL_POINTER_DOC_CLAMP=0|1` (clamp local/pointer windows to the current doc start blocks)
-- `SPECTRAL_GUMBEL_TOPK=0|1`
-- `SPECTRAL_GUMBEL_TOPK_K=<int>` (0 -> use M)
-- `SPECTRAL_GUMBEL_TOPK_TAU=<float>`
-- `SPECTRAL_GUMBEL_TOPK_SEED=<int>` (0 -> use `SEED`)
-- `SPECTRAL_POINTER_RESET_LEN=<int>` (tokens; 0 disables)
-- `SPECTRAL_POINTER_RESET_P=<float>`
-- `SPECTRAL_POINTER_RESET_DECAY_STEPS=<int>`
-- `SPECTRAL_TEACHER=0|1`
-- `SPECTRAL_TEACHER_EVERY=<int>`
-- `SPECTRAL_TEACHER_LEN=<int>` (tokens; must be divisible by 128)
-- `SPECTRAL_TEACHER_LAYER=<int>` (0-based layer index)
-- `SPECTRAL_TEACHER_HEADS=<int>` (0 -> all heads)
-- `SPECTRAL_TEACHER_TEMP=<float>` (student include probability temperature)
-- `SPECTRAL_TEACHER_LAMBDA_COV=<float>`
-- `SPECTRAL_TEACHER_LAMBDA_BUDGET=<float>`
-- `SPECTRAL_TEACHER_DETACH_BACKBONE=0|1`
-- `SPECTRAL_TEACHER_NCE=0|1`
-- `SPECTRAL_TEACHER_NCE_POS=<int>`
-- `SPECTRAL_TEACHER_NCE_NEG=<int>`
-- `SPECTRAL_TEACHER_LAMBDA_NCE=<float>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
-- `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=<int>`
-- `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=<int>`
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE=0|1` (active cap on Δ*; reduces saturation to 0/max)
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MIN=<int>` (`-1` -> `SPECTRAL_L_TRAIN-1` default)
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MAX=<int>` (`-1` -> `max(TRAIN_SEQ_LEN,VAL_SEQ_LEN)-1` default)
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP=<int>`
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS=<int>`
-- `SPECTRAL_PI_ENTROPY_FLOOR_FRAC=<float>` (only penalize entropy below this fraction of `log(M)`)
-- `SPECTRAL_LAMBDA_DELTA_EDGE=<float>` (Δ* edge-avoidance reg strength)
-- `SPECTRAL_DELTA_EDGE_EPS=<float>` (normalized edge band, e.g. `0.05`)
-- `SPECTRAL_DELTA_EDGE_SCHEDULE_START_STEP=<int>`
-- `SPECTRAL_DELTA_EDGE_SCHEDULE_STEPS=<int>`
-
-## Checkpointing
-
-- `SAVE_CHECKPOINT=0|1` (default `1`) saves a `state_step*.pt` at the end of the run (rank0 only)
-- `SAVE_OPTIMIZERS=0|1` (default `0`) additionally includes optimizer states (large; usually unnecessary)
-
-## FlexAttention Controls (env vars)
-
-- `FLEXATTN_DYNAMO_DISABLE=0|1` (graph-break around FlexAttention; use only as a workaround for compiler issues)
-- `FLEXATTN_COMPILE=0|1` (when graph-broken, compile FlexAttention standalone to keep fused kernels)
 
 ### Validation pointer-mask state
 
@@ -99,12 +53,11 @@ unless forced:
 
 ## Telemetry (rank0)
 
-`scoped_medium.py` emits JSON:
+`modded-nanogpt/scoped_medium.py` emits JSON:
 
 - `SCOPE_BINS`: bin edges at startup.
-- `SCOPE_STATS`: every `SCOPE_LOG_EVERY` steps (KV unique-block stats + pointer behavior proxies like
-  `ptr_center_block0_frac_excl` / `ptr_center_docstart_frac`, plus `delta_star_max_active`, `pi` entropy, and regularizers).
-- `NEEDLE_EVAL`: optional synthetic NIAH retrieval eval (by distance), gated by `NEEDLE_EVAL=1`.
+- `SCOPE_STATS`: every `SCOPE_LOG_EVERY` steps (KV unique-block stats, pointer behavior proxies,
+  `pi` entropy, and regularizer magnitudes).
 
 ## Current Blocker / Debug Context
 
