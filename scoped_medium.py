@@ -6,6 +6,7 @@ import uuid
 import time
 import copy
 import json
+import math
 import random
 from dataclasses import dataclass
 from functools import lru_cache
@@ -25,6 +26,17 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from model.attn_bias import SpectralBias
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+
+# Optionally prevent torch.compile from capturing FlexAttention (useful when Inductor hits a FlexAttention lowering bug).
+try:
+    import torch._dynamo as _dynamo  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    _dynamo = None  # type: ignore[assignment]
+
+def _flex_attention_call(*args, **kwargs):
+    return flex_attention(*args, **kwargs)
+
+flex_attention_nocompile = _dynamo.disable(_flex_attention_call) if _dynamo is not None else _flex_attention_call
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -292,6 +304,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, docs: Tensor) -> tuple[Tensor, Tensor]:
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
+        fa = flex_attention_nocompile if getattr(args, "flexattn_dynamo_disable", False) else flex_attention
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q_for_bias = q.transpose(1, 2)  # [B,H,T,D] before rotary
@@ -330,50 +343,98 @@ class CausalSelfAttention(nn.Module):
                     block_size=128,
                 )
 
-            def score_mod(score, b, h, q_idx, kv_idx):
-                # FlexAttention may call score_mod with scalar indices during fake/compile; normalize to 1-D.
-                q = q_idx.to(torch.long).reshape(-1)  # [Q]
-                k = kv_idx.to(torch.long).reshape(-1)  # [Kv]
-                # NOTE: max clamp is unnecessary for valid token indices (0..T-1) and
-                # adds extra work / temporaries during compilation.
-                delta = (q[:, None] - k[None, :]).clamp(min=0)  # [Q,Kv]
+            spectral_impl = str(getattr(args, "spectral_impl", "score_mod")).strip().lower()
+            if spectral_impl == "qk_aug":
+                # Implement beta * b_q(i-j) by augmenting Q/K with position-dependent features, avoiding score_mod.
+                # b_q(Δ)=Σ_k A_k(q)cos(ω_kΔ)+B_k(q)sin(ω_kΔ) can be rewritten using cos(a-b), sin(a-b) identities.
+                s = math.sqrt(beta / float(self.attn_scale))
+                # cos/sin tables are [K,T]; transpose to [T,K] for broadcasting.
+                cos_t = cos_wD.transpose(0, 1).to(dtype=torch.float32)  # [T,K]
+                sin_t = sin_wD.transpose(0, 1).to(dtype=torch.float32)  # [T,K]
+                cos_bhtk = cos_t[None, None].expand(B, self.num_heads, T, K)
+                sin_bhtk = sin_t[None, None].expand(B, self.num_heads, T, K)
 
-                A = coeff_cos[b, h, q]  # [Q,K]
-                Bc = coeff_sin[b, h, q]  # [Q,K]
+                Qcos = coeff_cos * cos_bhtk + coeff_sin * sin_bhtk  # [B,H,T,K]
+                Qsin = coeff_cos * sin_bhtk - coeff_sin * cos_bhtk  # [B,H,T,K]
+                q_pos = torch.cat([Qcos, Qsin], dim=-1)  # [B,H,T,2K]
+                k_pos = torch.cat([cos_bhtk, sin_bhtk], dim=-1)  # [B,H,T,2K]
 
-                # Accumulate per-frequency to avoid materializing [Q,Kv,K] intermediates (shared-mem blowups).
-                bias = score.new_zeros(delta.shape, dtype=torch.float32)
-                for kk in range(K):
-                    bias = bias + A[:, kk : kk + 1] * cos_wD[kk, delta] + Bc[:, kk : kk + 1] * sin_wD[kk, delta]
-
-                delta_f = delta.to(dtype=bias.dtype)
-                if subtract_b0:
-                    bias = bias - b0[b, h, q][:, None]
                 if use_slope:
-                    bias = bias + slope[b, h, q][:, None] * delta_f
-                if gate_kind != "none" and ramp_lambda > 0:
-                    dm = delta_main[b, h, q][:, None]
-                    w = width[b, h, q][:, None]
-                    x = (delta_f - dm).abs()
-                    x = (x - w) / tau
-                    if gate_kind == "relu":
-                        bias = bias - ramp_lambda * torch.relu(x)
-                    else:
-                        bias = bias - ramp_lambda * F.softplus(x)
+                    # slope*(i-j) differs from -slope*j by a per-row constant (slope*i), which is softmax-invariant.
+                    pos = torch.arange(T, device=x.device, dtype=torch.float32)
+                    q_pos = torch.cat([q_pos, (-slope).unsqueeze(-1)], dim=-1)
+                    k_pos = torch.cat([k_pos, pos[None, None, :, None].expand(B, self.num_heads, T, 1)], dim=-1)
 
-                bias = bias.reshape_as(score)
-                return score + beta * bias.to(dtype=score.dtype)
+                q_pos = (q_pos * s).to(dtype=q.dtype)
+                k_pos = (k_pos * s).to(dtype=q.dtype)
 
-            y = flex_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                block_mask=block_mask,
-                score_mod=score_mod,
-                scale=self.attn_scale,
-            ).transpose(1, 2)
+                q_bhtd = q.transpose(1, 2)
+                k_bhtd = k.transpose(1, 2)
+                v_bhtd = v.transpose(1, 2)
+                pad_dim = int(q_pos.size(-1))
+                q_aug = torch.cat([q_bhtd, q_pos], dim=-1)
+                k_aug = torch.cat([k_bhtd, k_pos], dim=-1)
+                v_aug = torch.cat([v_bhtd, v_bhtd.new_zeros((B, self.num_heads, T, pad_dim))], dim=-1)
+                # Some kernels are much happier when the head dim is a small multiple (e.g. 8/16).
+                align = int(getattr(args, "spectral_qk_aug_align", 16))
+                if align > 1:
+                    d_aug = int(q_aug.size(-1))
+                    d_aligned = ((d_aug + align - 1) // align) * align
+                    extra = d_aligned - d_aug
+                    if extra > 0:
+                        z = q_aug.new_zeros((B, self.num_heads, T, extra))
+                        q_aug = torch.cat([q_aug, z], dim=-1)
+                        k_aug = torch.cat([k_aug, z], dim=-1)
+                        v_aug = torch.cat([v_aug, z], dim=-1)
+                y = fa(q_aug, k_aug, v_aug, block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+                y = y[..., : self.head_dim]
+            elif spectral_impl == "score_mod":
+                def score_mod(score, b, h, q_idx, kv_idx):
+                    # FlexAttention may call score_mod with scalar indices during fake/compile; normalize to 1-D.
+                    q = q_idx.to(torch.long).reshape(-1)  # [Q]
+                    k = kv_idx.to(torch.long).reshape(-1)  # [Kv]
+                    # NOTE: max clamp is unnecessary for valid token indices (0..T-1) and
+                    # adds extra work / temporaries during compilation.
+                    delta = (q[:, None] - k[None, :]).clamp(min=0)  # [Q,Kv]
+
+                    A = coeff_cos[b, h, q]  # [Q,K]
+                    Bc = coeff_sin[b, h, q]  # [Q,K]
+
+                    # Accumulate per-frequency to avoid materializing [Q,Kv,K] intermediates (shared-mem blowups).
+                    bias = score.new_zeros(delta.shape, dtype=torch.float32)
+                    for kk in range(K):
+                        bias = bias + A[:, kk : kk + 1] * cos_wD[kk, delta] + Bc[:, kk : kk + 1] * sin_wD[kk, delta]
+
+                    delta_f = delta.to(dtype=bias.dtype)
+                    if subtract_b0:
+                        bias = bias - b0[b, h, q][:, None]
+                    if use_slope:
+                        bias = bias + slope[b, h, q][:, None] * delta_f
+                    if gate_kind != "none" and ramp_lambda > 0:
+                        dm = delta_main[b, h, q][:, None]
+                        w = width[b, h, q][:, None]
+                        x = (delta_f - dm).abs()
+                        x = (x - w) / tau
+                        if gate_kind == "relu":
+                            bias = bias - ramp_lambda * torch.relu(x)
+                        else:
+                            bias = bias - ramp_lambda * F.softplus(x)
+
+                    bias = bias.reshape_as(score)
+                    return score + beta * bias.to(dtype=score.dtype)
+
+                y = fa(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    block_mask=block_mask,
+                    score_mod=score_mod,
+                    scale=self.attn_scale,
+                ).transpose(1, 2)
+            else:
+                raise ValueError(f"unknown SCOPE spectral_impl={spectral_impl!r} (expected: qk_aug|score_mod)")
         else:
-            y = flex_attention(
+            y = fa(
                 q.transpose(1, 2),
                 k.transpose(1, 2),
                 v.transpose(1, 2),
@@ -567,6 +628,8 @@ class Hyperparameters:
     vocab_size = 50257
     # SCOPE: spectral bias (see SPEC.md)
     spectral_bias = True
+    spectral_impl = "qk_aug"  # "qk_aug" (no score_mod) | "score_mod"
+    spectral_qk_aug_align = 16  # pad augmented head dim up to a multiple of this (e.g. 8/16) for kernel friendliness
     spectral_K = 6
     spectral_M = 2
     spectral_beta = 0.5
@@ -601,6 +664,17 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     scope_log_every = 200 # rank0-only SCOPE debug stats
     save_checkpoint = False
+    # logging / diagnostics
+    log_all_ranks = False  # write one logfile per rank (debugging)
+    flexattn_dynamo_disable = False  # graph-break around FlexAttention (compiler workaround)
+    # torch.compile controls (FlexAttention still JITs its own kernels)
+    torch_compile = True
+    torch_compile_backend = "inductor"
+    torch_compile_mode = "default"  # "default"|"reduce-overhead"|"max-autotune"
+    torch_compile_fullgraph = False
+    torch_dynamo_verbose = False
+    torch_dynamo_suppress_errors = False  # fallback to eager inside torch.compile
+    torch_compile_fallback_to_eager = True  # if compile errors escape, retry eager
 args = Hyperparameters()
 
 def _env_str(key: str, default: str) -> str:
@@ -636,11 +710,21 @@ args.num_iterations = _env_int("NUM_ITERATIONS", args.num_iterations)
 args.val_loss_every = _env_int("VAL_LOSS_EVERY", args.val_loss_every)
 args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)
 args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint)
+args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)
+args.flexattn_dynamo_disable = _env_bool("FLEXATTN_DYNAMO_DISABLE", args.flexattn_dynamo_disable)
 args.cooldown_frac = _env_float("COOLDOWN_FRAC", args.cooldown_frac)
 args.seed = _env_int("SEED", args.seed)
 
 # SCOPE toggles/knobs.
 args.spectral_bias = _env_bool("SPECTRAL_BIAS", args.spectral_bias)
+args.spectral_impl = _env_str("SPECTRAL_IMPL", args.spectral_impl)
+args.spectral_qk_aug_align = _env_int("SPECTRAL_QK_AUG_ALIGN", args.spectral_qk_aug_align)
+args.spectral_K = _env_int("SPECTRAL_K", args.spectral_K)
+args.spectral_M = _env_int("SPECTRAL_M", args.spectral_M)
+args.spectral_beta = _env_float("SPECTRAL_BETA", args.spectral_beta)
+args.spectral_use_slope = _env_bool("SPECTRAL_USE_SLOPE", args.spectral_use_slope)
+args.spectral_ramp_lambda = _env_float("SPECTRAL_RAMP_LAMBDA", args.spectral_ramp_lambda)
+args.spectral_gate_kind = _env_str("SPECTRAL_GATE_KIND", args.spectral_gate_kind)
 args.spectral_use_pointer_mask = _env_bool("SPECTRAL_USE_POINTER_MASK", args.spectral_use_pointer_mask)
 args.spectral_pointer_schedule = _env_bool("SPECTRAL_POINTER_SCHEDULE", args.spectral_pointer_schedule)
 args.spectral_pointer_schedule_disable_steps = _env_int("SPECTRAL_POINTER_SCHEDULE_DISABLE_STEPS", args.spectral_pointer_schedule_disable_steps)
@@ -651,6 +735,19 @@ args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOC
 args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
 args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
+
+# Default to graph-breaking around FlexAttention when SCOPE is enabled (workaround for occasional Inductor flex_attention lowering bugs).
+if os.environ.get("FLEXATTN_DYNAMO_DISABLE") is None:
+    args.flexattn_dynamo_disable = bool(args.spectral_bias)
+
+# torch.compile toggles/knobs.
+args.torch_compile = _env_bool("TORCH_COMPILE", args.torch_compile)
+args.torch_compile_backend = _env_str("TORCH_COMPILE_BACKEND", args.torch_compile_backend)
+args.torch_compile_mode = _env_str("TORCH_COMPILE_MODE", args.torch_compile_mode)
+args.torch_compile_fullgraph = _env_bool("TORCH_COMPILE_FULLGRAPH", args.torch_compile_fullgraph)
+args.torch_dynamo_verbose = _env_bool("TORCHDYNAMO_VERBOSE", args.torch_dynamo_verbose)
+args.torch_dynamo_suppress_errors = _env_bool("TORCHDYNAMO_SUPPRESS_ERRORS", args.torch_dynamo_suppress_errors)
+args.torch_compile_fallback_to_eager = _env_bool("TORCH_COMPILE_FALLBACK_TO_EAGER", args.torch_compile_fallback_to_eager)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -663,6 +760,13 @@ dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
+# Best-effort cleanup on exceptions (avoids NCCL resource leak warnings).
+import atexit
+def _destroy_process_group():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+atexit.register(_destroy_process_group)
+
 # Deterministic init across ablation runs (rank0 params are broadcast anyway).
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
@@ -671,22 +775,51 @@ import numpy as np
 np.random.seed(args.seed)
 
 # begin logging
+log_dir = os.environ.get("LOG_DIR", "logs")
+run_name = os.environ.get("RUN_NAME", "").strip()
+run_uuid = str(uuid.uuid4()) if master_process else ""
+_uuid_list = [run_uuid]
+dist.broadcast_object_list(_uuid_list, src=0)
+run_uuid = _uuid_list[0]
+run_prefix = f"{run_name}_" if run_name else ""
+run_id = f"{run_prefix}{run_uuid}"
+os.makedirs(log_dir, exist_ok=True)
 logfile = None
-if master_process:
-    log_dir = os.environ.get("LOG_DIR", "logs")
-    run_name = os.environ.get("RUN_NAME", "").strip()
-    run_uuid = uuid.uuid4()
-    run_prefix = f"{run_name}_" if run_name else ""
-    run_id = f"{run_prefix}{run_uuid}"
-    os.makedirs(log_dir, exist_ok=True)
-    logfile = f"{log_dir}/{run_id}.txt"
-    print(logfile)
+if args.log_all_ranks:
+    logfile = f"{log_dir}/{run_id}_rank{rank}.txt"
+    if master_process:
+        print(f"{log_dir}/{run_id}_rank*.txt")
+else:
+    logfile = f"{log_dir}/{run_id}.txt" if master_process else None
+    if master_process:
+        print(logfile)
+
+def _write_log(s: str):
+    if logfile is None:
+        return
+    with open(logfile, "a") as f:
+        print(s, file=f)
 def print0(s, console=False):
     if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+        _write_log(s)
+        if console:
+            print(s)
+def print_rank(s, console=False):
+    _write_log(s)
+    if console:
+        print(f"[rank{rank}] {s}")
+
+# Ensure uncaught exceptions are captured in logs (useful for compiler failures).
+_orig_excepthook = sys.excepthook
+def _logging_excepthook(exc_type, exc, tb):
+    import traceback
+    msg = "".join(traceback.format_exception(exc_type, exc, tb))
+    try:
+        print_rank(msg, console=True)
+    except Exception:
+        print(msg)
+    _orig_excepthook(exc_type, exc, tb)
+sys.excepthook = _logging_excepthook
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -699,6 +832,48 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+print0(
+    json.dumps(
+        dict(
+            tag="RUN_CFG",
+            seed=int(args.seed),
+            train_seq_len=int(args.train_seq_len),
+            val_seq_len=int(args.val_seq_len),
+            num_iterations=int(args.num_iterations),
+            val_loss_every=int(args.val_loss_every),
+            world_size=int(world_size),
+            torch_compile=dict(
+                enabled=bool(args.torch_compile),
+                backend=str(args.torch_compile_backend),
+                mode=str(args.torch_compile_mode),
+                fullgraph=bool(args.torch_compile_fullgraph),
+                dynamo_verbose=bool(args.torch_dynamo_verbose),
+                dynamo_suppress_errors=bool(args.torch_dynamo_suppress_errors),
+                fallback_to_eager=bool(args.torch_compile_fallback_to_eager),
+            ),
+            flexattn=dict(dynamo_disable=bool(args.flexattn_dynamo_disable)),
+            scope=dict(
+                enabled=bool(args.spectral_bias),
+                impl=str(args.spectral_impl),
+                qk_aug_align=int(getattr(args, "spectral_qk_aug_align", 0)),
+                K=int(args.spectral_K),
+                M=int(args.spectral_M),
+                beta=float(args.spectral_beta),
+                use_slope=bool(args.spectral_use_slope),
+                ramp_lambda=float(args.spectral_ramp_lambda),
+                gate_kind=str(args.spectral_gate_kind),
+                use_pointer_mask=bool(args.spectral_use_pointer_mask),
+                pointer_schedule=bool(args.spectral_pointer_schedule),
+                pointer_local_blocks=int(args.spectral_pointer_local_blocks),
+                pointer_half_blocks=int(args.spectral_pointer_half_blocks),
+                pointer_global_blocks=int(args.spectral_pointer_global_blocks),
+                val_force=bool(args.spectral_pointer_val_force),
+                val_half_blocks=int(args.spectral_pointer_val_half_blocks),
+            ),
+        )
+    ),
+    console=True,
+)
 
 ########################################
 #    Construct model and optimizer     #
@@ -907,7 +1082,102 @@ def get_window_size_blocks(step: int):
     return get_window_size_blocks_helper(window_size)
 
 maybe_update_pointer_mask(0)
-model: nn.Module = torch.compile(model, dynamic=False)
+compile_enabled = bool(args.torch_compile)
+if compile_enabled:
+    try:
+        import torch._dynamo as _dynamo  # type: ignore[import-not-found]
+
+        _dynamo.config.verbose = bool(args.torch_dynamo_verbose)
+        _dynamo.config.suppress_errors = bool(args.torch_dynamo_suppress_errors)
+    except Exception as e:
+        print_rank(json.dumps(dict(tag="DYNAMO_CONFIG_ERROR", error=str(e))), console=True)
+
+    compile_mode = args.torch_compile_mode.strip()
+    if compile_mode.lower() in {"", "none"}:
+        compile_mode = None  # type: ignore[assignment]
+    print0(
+        json.dumps(
+            dict(
+                tag="TORCH_COMPILE_CFG",
+                enabled=True,
+                backend=args.torch_compile_backend,
+                mode=compile_mode,
+                fullgraph=bool(args.torch_compile_fullgraph),
+                dynamo_verbose=bool(args.torch_dynamo_verbose),
+                dynamo_suppress_errors=bool(args.torch_dynamo_suppress_errors),
+                fallback_to_eager=bool(args.torch_compile_fallback_to_eager),
+            )
+        ),
+        console=True,
+    )
+    model = torch.compile(
+        model,
+        dynamic=False,
+        backend=args.torch_compile_backend,
+        mode=compile_mode,
+        fullgraph=bool(args.torch_compile_fullgraph),
+    )
+else:
+    print0(json.dumps(dict(tag="TORCH_COMPILE_CFG", enabled=False)), console=True)
+
+def _unwrap_compiled(m: nn.Module) -> nn.Module:
+    return getattr(m, "_orig_mod", m)
+
+def _is_compiler_error(e: BaseException) -> bool:
+    try:
+        from torch._dynamo.exc import BackendCompilerFailed  # type: ignore[import-not-found]
+    except Exception:
+        BackendCompilerFailed = ()  # type: ignore[assignment]
+    try:
+        from torch._inductor.exc import InductorError  # type: ignore[import-not-found]
+    except Exception:
+        InductorError = ()  # type: ignore[assignment]
+    if isinstance(e, (BackendCompilerFailed, InductorError)):  # type: ignore[arg-type]
+        return True
+    msg = repr(e)
+    return any(s in msg for s in ("torch._dynamo", "torch._inductor", "triton", "InductorError", "BackendCompilerFailed"))
+
+def _log_exception(e: BaseException, *, where: str):
+    import traceback
+
+    payload = dict(
+        tag="EXCEPTION",
+        where=str(where),
+        rank=int(rank),
+        local_rank=int(os.environ.get("LOCAL_RANK", "0")),
+        world_size=int(world_size),
+        compile_enabled=bool(compile_enabled),
+        pointer_mask=dict(enabled=pointer_mask_state.get("enabled"), half_blocks=pointer_mask_state.get("half_blocks")),
+        error_type=type(e).__name__,
+        error=str(e),
+    )
+    print_rank(json.dumps(payload), console=True)
+    # Full traceback: rank-local file if enabled, otherwise best-effort to rank0.
+    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    print_rank(tb, console=False)
+    if master_process:
+        print0(tb, console=True)
+    if torch.cuda.is_available():
+        mem = dict(
+            allocated=int(torch.cuda.memory_allocated() // (1024**2)),
+            reserved=int(torch.cuda.memory_reserved() // (1024**2)),
+            max_allocated=int(torch.cuda.max_memory_allocated() // (1024**2)),
+            max_reserved=int(torch.cuda.max_memory_reserved() // (1024**2)),
+        )
+        print_rank(json.dumps(dict(tag="CUDA_MEM_MIB", where=str(where), **mem)), console=True)
+
+def run_with_compile_fallback(fn, *, where: str):
+    global model, compile_enabled
+    try:
+        return fn()
+    except Exception as e:
+        _log_exception(e, where=where)
+        if compile_enabled and args.torch_compile_fallback_to_eager and _is_compiler_error(e):
+            model = _unwrap_compiled(model)
+            compile_enabled = False
+            print_rank(json.dumps(dict(tag="TORCH_COMPILE_FALLBACK", where=str(where))), console=True)
+            return fn()
+        raise
 
 ########################################
 #            Warmup kernels            #
@@ -915,17 +1185,19 @@ model: nn.Module = torch.compile(model, dynamic=False)
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
+initial_state = dict(model=copy.deepcopy(_unwrap_compiled(model).state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    def _warmup_fwd_bwd():
+        model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    run_with_compile_fallback(_warmup_fwd_bwd, where="warmup_fwd_bwd")
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
+_unwrap_compiled(model).load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del initial_state
@@ -969,7 +1241,9 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                def _val_fwd():
+                    return model(inputs, targets, get_window_size_blocks(step))
+                val_loss += run_with_compile_fallback(_val_fwd, where=f"val_fwd_step{step}")
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -992,8 +1266,11 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     window_blocks = get_window_size_blocks(step)
-    train_loss = model(inputs, targets, window_blocks)
-    train_loss.backward()
+    def _train_fwd_bwd():
+        loss = model(inputs, targets, window_blocks)
+        loss.backward()
+        return loss
+    train_loss = run_with_compile_fallback(_train_fwd_bwd, where=f"train_fwd_bwd_step{step}")
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # set optimization hyperparameters

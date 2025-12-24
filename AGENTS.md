@@ -1,8 +1,6 @@
 # Agent Notes (SCOPE)
 
-This workspace contains a nested training repo in `modded-nanogpt/` (it also has its own `.git/`).
-Unless a task explicitly says otherwise, treat `modded-nanogpt/` as the primary codebase for model
-training + experiments.
+This repo is the SCOPE research codebase (flattened; no nested repos).
 
 ## Project Goal
 
@@ -16,20 +14,20 @@ Core ideas:
 - A **pointer-driven block-sparse KV mask** so far keys enter attention compute during training
   (union of local band + pointer windows + optional global anchors).
 
-`modded-nanogpt/SPEC.md` is the source-of-truth spec.
+`SPEC.md` is the source-of-truth spec.
 
 ## Source Of Truth / Do-Not-Edit
 
-- `modded-nanogpt/SPEC.md`: full project specification.
-- `modded-nanogpt/baseline.py`: frozen snapshot for ablations (do not modify).
+- `SPEC.md`: full project specification.
+- `baseline.py`: frozen snapshot for ablations (do not modify).
 
 ## Repo Map (key files)
 
-- `modded-nanogpt/scoped_medium.py`: end-to-end training script (model + data + DDP + training loop).
-- `modded-nanogpt/model/attn_bias.py`: `SpectralBias` implementation + pointer `BlockMask` builder + telemetry buffers.
-- `modded-nanogpt/run_ablations.sh`: A/B/C ablation harness.
-- `modded-nanogpt/Dockerfile`: container build for Vast.ai.
-- `modded-nanogpt/.github/workflows/ghcr.yml`: GHCR build/push workflow.
+- `scoped_medium.py`: end-to-end training script (model + data + DDP + training loop).
+- `model/attn_bias.py`: `SpectralBias` implementation + pointer `BlockMask` builder + telemetry buffers.
+- `run_ablations.sh`: A/B/C ablation harness.
+- `Dockerfile`: container build for Vast.ai.
+- `.github/workflows/ghcr.yml`: GHCR build/push workflow.
 
 ## SCOPE Controls (env vars)
 
@@ -37,6 +35,7 @@ Primary toggles used by `run_ablations.sh`:
 
 - `SPECTRAL_BIAS=0|1`
 - `SPECTRAL_IMPL=qk_aug|score_mod`
+- `SPECTRAL_QK_AUG_ALIGN=16`
 - `SPECTRAL_USE_POINTER_MASK=0|1`
 - `SPECTRAL_POINTER_SCHEDULE=0|1`
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=<int>`
@@ -53,7 +52,7 @@ unless forced:
 
 ## Telemetry (rank0)
 
-`modded-nanogpt/scoped_medium.py` emits JSON:
+`scoped_medium.py` emits JSON:
 
 - `SCOPE_BINS`: bin edges at startup.
 - `SCOPE_STATS`: every `SCOPE_LOG_EVERY` steps (KV unique-block stats, pointer behavior proxies,
