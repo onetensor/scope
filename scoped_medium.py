@@ -326,29 +326,31 @@ class CausalSelfAttention(nn.Module):
                 )
 
             def score_mod(score, b, h, q_idx, kv_idx):
-                # FlexAttention may call score_mod with q_idx/kv_idx as 0-D tensors during fake/compile.
-                # Reshape to 1-D so [:, None] broadcasts are always valid.
-                q_idx_l = q_idx.to(torch.long).reshape(-1)
-                kv_idx_l = kv_idx.to(torch.long).reshape(-1)
-                delta = (q_idx_l[:, None] - kv_idx_l[None, :]).clamp(min=0, max=T - 1)
-                cos = cos_wD[:, delta].permute(1, 2, 0)
-                sin = sin_wD[:, delta].permute(1, 2, 0)
-                A = coeff_cos[b, h, q_idx_l]
-                Bc = coeff_sin[b, h, q_idx_l]
-                bias = (A[:, None, :] * cos).sum(dim=-1) + (Bc[:, None, :] * sin).sum(dim=-1)
+                # FlexAttention may pass scalar or broadcastable index tensors; keep everything elementwise.
+                q_i = q_idx.to(torch.long)
+                k_i = kv_idx.to(torch.long)
+                delta = (q_i - k_i).clamp(min=0, max=T - 1)  # same shape as `score` (broadcasted)
+                # Lookup cos/sin(w * Δ) without materializing [T,T].
+                cos = cos_wD.T[delta]  # [..., K]
+                sin = sin_wD.T[delta]  # [..., K]
+                A = coeff_cos[b, h, q_i]  # [..., K]
+                Bc = coeff_sin[b, h, q_i]  # [..., K]
+                bias = (A * cos).sum(dim=-1) + (Bc * sin).sum(dim=-1)  # [...]
                 if subtract_b0:
-                    bias = bias - b0[b, h, q_idx_l][:, None]
+                    bias = bias - b0[b, h, q_i]
                 if use_slope:
-                    bias = bias + slope[b, h, q_idx_l][:, None] * delta.to(dtype=bias.dtype)
+                    bias = bias + slope[b, h, q_i] * delta.to(dtype=bias.dtype)
                 if gate_kind != "none" and ramp_lambda > 0:
-                    dm = delta_main[b, h, q_idx_l]
-                    w = width[b, h, q_idx_l]
-                    x = (delta.to(dtype=bias.dtype) - dm[:, None]).abs()
-                    x = (x - w[:, None]) / tau
+                    dm = delta_main[b, h, q_i]
+                    w = width[b, h, q_i]
+                    x = (delta.to(dtype=bias.dtype) - dm).abs()
+                    x = (x - w) / tau
                     if gate_kind == "relu":
                         bias = bias - ramp_lambda * torch.relu(x)
                     else:
                         bias = bias - ramp_lambda * F.softplus(x)
+                # Ensure output has the same shape as `score` (important for fake tracing).
+                bias = bias + score.to(dtype=bias.dtype) * 0
                 return score + beta * bias.to(dtype=score.dtype)
 
             y = flex_attention(
@@ -431,8 +433,10 @@ class GPT(nn.Module):
             docs = (input_seq == 50256).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
+            q = q_idx.to(torch.long)
+            k = kv_idx.to(torch.long)
+            causal_mask = q >= k
+            document_mask = docs[q] == docs[k]
             return causal_mask & document_mask
 
         def dense_to_ordered(dense_blockmask: Tensor):
