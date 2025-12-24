@@ -31,7 +31,7 @@ This code expects pre-tokenized `.bin` shards (same format as `data/cached_finew
 
 ### Single run
 
-From the repo root:
+From `modded-nanogpt/`:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 scoped_medium.py
@@ -43,7 +43,6 @@ Useful overrides:
 - `TRAIN_SEQ_LEN=65536` / `VAL_SEQ_LEN=65536`
 - `VAL_LOSS_EVERY=0` (end-only) or a small interval
 - `VAL_TOKENS=10485760`
-- `SAVE_CHECKPOINT=1` (default) to save `state_step*.pt` under `LOG_DIR/<run_id>/`
 
 ### 3-run ablations (recommended)
 
@@ -62,23 +61,6 @@ Controls:
 - `NUM_ITERATIONS`, `VAL_TOKENS`, `VAL_LOSS_EVERY`, `SEED`
 - `SCOPE_LOG_EVERY=200` (rank0-only SCOPE stats cadence)
 
-## Needle-in-a-Haystack Eval (synthetic)
-
-Emits a rank0 JSON blob with `tag="NEEDLE_EVAL"` (loss/ppl/token-acc/EM by distance):
-
-- `NEEDLE_EVAL=1`
-- `NEEDLE_SEQ_LEN=65536`
-- `NEEDLE_DISTANCES=4096,8192,16384,32768`
-- `NEEDLE_SAMPLES_PER_DISTANCE=8`
-- `NEEDLE_ANCHOR_LEN=4`
-- `NEEDLE_VALUE_LEN=8`
-
-Evaluate a saved checkpoint without training:
-
-```bash
-LOAD_CHECKPOINT=/path/to/state_step001000.pt NUM_ITERATIONS=0 VAL_LOSS_EVERY=0 NEEDLE_EVAL=1 torchrun --standalone --nproc_per_node=8 scoped_medium.py
-```
-
 ## SCOPE Controls (env vars)
 
 - `SPECTRAL_BIAS=0|1`
@@ -86,21 +68,7 @@ LOAD_CHECKPOINT=/path/to/state_step001000.pt NUM_ITERATIONS=0 VAL_LOSS_EVERY=0 N
 - `SPECTRAL_POINTER_SCHEDULE=0|1`
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=16`
 - `SPECTRAL_POINTER_HALF_BLOCKS=4`
-- `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this extra block budget across peaks)
-- `SPECTRAL_POINTER_RADIUS_MODE=fixed|pi`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=0|1|2`
-- `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=2`
-- `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=300`
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE=0|1`
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MIN=<int>` (`-1` -> `SPECTRAL_L_TRAIN-1` default)
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MAX=<int>` (`-1` -> `max(TRAIN_SEQ_LEN,VAL_SEQ_LEN)-1` default)
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP=<int>`
-- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS=<int>`
-- `SPECTRAL_PI_ENTROPY_FLOOR_FRAC=<float>` (only penalize entropy below this fraction of `log(M)`)
-- `SPECTRAL_LAMBDA_DELTA_EDGE=<float>` (Δ* edge-avoidance reg strength)
-- `SPECTRAL_DELTA_EDGE_EPS=<float>` (normalized edge band, e.g. `0.05`)
-- `SPECTRAL_DELTA_EDGE_SCHEDULE_START_STEP=<int>`
-- `SPECTRAL_DELTA_EDGE_SCHEDULE_STEPS=<int>`
 
 ### Validation pointer-mask state
 
@@ -118,8 +86,6 @@ You can force pointer masking during validation:
 - `TORCHDYNAMO_VERBOSE=0|1`
 - `TORCHDYNAMO_SUPPRESS_ERRORS=0|1`
 - `TORCH_COMPILE_FALLBACK_TO_EAGER=0|1`
-- `FLEXATTN_DYNAMO_DISABLE=0|1` (graph-break around FlexAttention if needed)
-- `FLEXATTN_COMPILE=0|1` (compile FlexAttention standalone when graph-broken; keeps fused kernel)
 - `LOG_ALL_RANKS=0|1` (write one logfile per rank)
 
 ## Docker / Vast.ai
