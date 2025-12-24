@@ -218,11 +218,20 @@ class SpectralBias(nn.Module):
         if self.detach_q:
             q = q.detach()
         if self.share_across_heads:
-            return self.mlp(q)
+            # Keep MLP compute in the same dtype as q (bf16 in this project) to
+            # avoid matmul dtype mismatches without forcing q -> fp32 (large).
+            q_dtype = q.dtype
+            fc1: nn.Linear = self.mlp[0]
+            fc2: nn.Linear = self.mlp[2]
+            x = F.linear(q, fc1.weight.to(dtype=q_dtype), None if fc1.bias is None else fc1.bias.to(dtype=q_dtype))
+            x = F.silu(x)
+            y = F.linear(x, fc2.weight.to(dtype=q_dtype), None if fc2.bias is None else fc2.bias.to(dtype=q_dtype))
+            return y
         # q: [B,H,L,D]
-        x = torch.einsum("bhld,hkd->bhlk", q, self.w1) + self.b1[None, :, None, :]
+        q_dtype = q.dtype
+        x = torch.einsum("bhld,hkd->bhlk", q, self.w1.to(dtype=q_dtype)) + self.b1.to(dtype=q_dtype)[None, :, None, :]
         x = F.silu(x)
-        y = torch.einsum("bhlk,hok->bhlo", x, self.w2) + self.b2[None, :, None, :]
+        y = torch.einsum("bhlk,hok->bhlo", x, self.w2.to(dtype=q_dtype)) + self.b2.to(dtype=q_dtype)[None, :, None, :]
         return y
 
     def _get_trig_tables(self, L: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:
