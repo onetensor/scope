@@ -1,0 +1,456 @@
++-----------------------------------------------------------------------------------------+
+root@C.29160469:~$ python - << 'EOF'
+> import torch
+> import torch
+> print("CUDA available:", torch.cuda.is_available())
+> print("Device:", torch.cuda.get_device_name(0))
+> EOF
+
+CUDA available: True
+Device: NVIDIA H100 80GB HBM3
+root@C.29160469:~$
+root@C.29160469:~$ TORCH_LOGS=inductor python - << 'EOF'
+import torch
+from torch.nn.attention import flex_attention
+print("flex_attention import OK")
+EOF
+flex_attention import OK
+root@C.29160469:~$ cd /modded-nanogpt
+root@C.29160469:/modded-nanogpt$ ls
+Dockerfile  README.md  baseline.py  model       ports.log         run.sh            scoped_medium.py
+LICENSE     SPEC.md    data         onstart.sh  requirements.txt  run_ablations.sh
+root@C.29160469:/modded-nanogpt$ python data/cached_fineweb10B.py 9
+fineweb_val_000000.bin: 100%|████████████████████████████████████████████████████████| 200M/200M [00:03<00:00, 63.8MB/s]
+fineweb_train_000001.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:02<00:00, 83.4MB/s]
+fineweb_train_000002.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:06<00:00, 30.7MB/s]
+fineweb_train_000003.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:02<00:00, 78.3MB/s]
+fineweb_train_000004.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:04<00:00, 45.0MB/s]
+fineweb_train_000005.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:02<00:00, 78.9MB/s]
+fineweb_train_000006.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:02<00:00, 82.5MB/s]
+fineweb_train_000007.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:02<00:00, 81.2MB/s]
+fineweb_train_000008.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:02<00:00, 82.0MB/s]
+fineweb_train_000009.bin: 100%|██████████████████████████████████████████████████████| 200M/200M [00:04<00:00, 43.5MB/s]
+root@C.29160469:/modded-nanogpt$ bash run_ablations.sh
+=== A_baseline ===
+W1224 00:16:15.035000 768 torch/distributed/run.py:853]
+W1224 00:16:15.035000 768 torch/distributed/run.py:853] *****************************************
+W1224 00:16:15.035000 768 torch/distributed/run.py:853] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+W1224 00:16:15.035000 768 torch/distributed/run.py:853] *****************************************
+logs/ablations/20251224_001614/A_baseline_32db4823-bbb9-4960-ad17-9fc604a03ef2.txt
+[rank4]: Traceback (most recent call last):
+[rank4]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank4]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank4]:     torch.autograd.backward(
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank4]:     _engine_run_backward(
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank4]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank4]:     return user_fn(self, *args)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank4]:     return impl_fn()
+[rank4]:            ^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank4]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank4]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank4]:     out = call_func_at_runtime_with_args(
+[rank4]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank4]:     out = normalize_as_list(f(args))
+[rank4]:                             ^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank4]:     return fn(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank4]:     return self.current_callable(inputs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank4]:     out = model(new_inputs)
+[rank4]:           ^^^^^^^^^^^^^^^^^
+[rank4]:   File "/tmp/torchinductor_root/5t/c5tij243ejlrls5ggvuepmhtgxatfezsh3jxj2ah2lhentn73s5t.py", line 5591, in call
+[rank4]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank4]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank4]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank4]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank4]: Use torch.library.opcheck to test your custom op.
+[rank4]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank6]: Traceback (most recent call last):
+[rank6]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank6]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank6]:     torch.autograd.backward(
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank6]:     _engine_run_backward(
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank6]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank6]:     return user_fn(self, *args)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank6]:     return impl_fn()
+[rank6]:            ^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank6]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank6]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank6]:     out = call_func_at_runtime_with_args(
+[rank6]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank6]:     out = normalize_as_list(f(args))
+[rank6]:                             ^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank6]:     return fn(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank6]:     return self.current_callable(inputs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank6]:     out = model(new_inputs)
+[rank6]:           ^^^^^^^^^^^^^^^^^
+[rank6]:   File "/tmp/torchinductor_root/ea/cearz5ghrrgv5zyxc5g4qw6bwzsl7dz7xu3q6qmwfclbwt2owxz5.py", line 5591, in call
+[rank6]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank6]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank6]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank6]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank6]: Use torch.library.opcheck to test your custom op.
+[rank6]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank2]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank2]:     torch.autograd.backward(
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank2]:     _engine_run_backward(
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank2]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank2]:     return user_fn(self, *args)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank2]:     return impl_fn()
+[rank2]:            ^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank2]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank2]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank2]:     out = call_func_at_runtime_with_args(
+[rank2]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank2]:     return self.current_callable(inputs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank2]:     out = model(new_inputs)
+[rank2]:           ^^^^^^^^^^^^^^^^^
+[rank2]:   File "/tmp/torchinductor_root/kd/ckdxcrhus3f6ymfjd4dba4do7o4gynh3tyct3msi7hzedyezwtq3.py", line 5591, in call
+[rank2]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank2]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank2]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank2]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank2]: Use torch.library.opcheck to test your custom op.
+[rank2]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank3]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank3]:     torch.autograd.backward(
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank3]:     _engine_run_backward(
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank3]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank3]:     return user_fn(self, *args)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank3]:     return impl_fn()
+[rank3]:            ^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank3]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank3]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank3]:     out = call_func_at_runtime_with_args(
+[rank3]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank3]:     out = normalize_as_list(f(args))
+[rank3]:                             ^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank3]:     return self.current_callable(inputs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank3]:     out = model(new_inputs)
+[rank3]:           ^^^^^^^^^^^^^^^^^
+[rank3]:   File "/tmp/torchinductor_root/e2/ce25nxb5pnxzoihbgzbx4qezy3drggy2vlxeh74tu4subiaghddt.py", line 5591, in call
+[rank3]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank3]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank3]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank3]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank3]: Use torch.library.opcheck to test your custom op.
+[rank3]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank7]: Traceback (most recent call last):
+[rank7]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank7]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank7]:     torch.autograd.backward(
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank7]:     _engine_run_backward(
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank7]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank7]:     return user_fn(self, *args)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank7]:     return impl_fn()
+[rank7]:            ^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank7]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank7]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank7]:     out = call_func_at_runtime_with_args(
+[rank7]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank7]:     out = normalize_as_list(f(args))
+[rank7]:                             ^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank7]:     return fn(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank7]:     return self.current_callable(inputs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank7]:     out = model(new_inputs)
+[rank7]:           ^^^^^^^^^^^^^^^^^
+[rank7]:   File "/tmp/torchinductor_root/43/c4345s4n5tnlvrn3ofa45mnuukgrv6k6suqtolvsvjictzz2sv6s.py", line 5591, in call
+[rank7]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank7]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank7]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank7]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank7]: Use torch.library.opcheck to test your custom op.
+[rank7]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank0]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank0]:     torch.autograd.backward(
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank0]:     _engine_run_backward(
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank0]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank0]:     return user_fn(self, *args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank0]:     return impl_fn()
+[rank0]:            ^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank0]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank0]:     out = call_func_at_runtime_with_args(
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank0]:     out = normalize_as_list(f(args))
+[rank0]:                             ^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank0]:     return self.current_callable(inputs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank0]:     out = model(new_inputs)
+[rank0]:           ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/tmp/torchinductor_root/hd/chdg3ft2nwwz3vq6xre3pl76a3otsvtoeigduhm7rwqajvjxhupy.py", line 5591, in call
+[rank0]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank0]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank0]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank0]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank0]: Use torch.library.opcheck to test your custom op.
+[rank0]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank5]: Traceback (most recent call last):
+[rank5]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank5]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank5]:     torch.autograd.backward(
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank5]:     _engine_run_backward(
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank5]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank5]:     return user_fn(self, *args)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank5]:     return impl_fn()
+[rank5]:            ^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank5]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank5]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank5]:     out = call_func_at_runtime_with_args(
+[rank5]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank5]:     out = normalize_as_list(f(args))
+[rank5]:                             ^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank5]:     return fn(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank5]:     return self.current_callable(inputs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank5]:     out = model(new_inputs)
+[rank5]:           ^^^^^^^^^^^^^^^^^
+[rank5]:   File "/tmp/torchinductor_root/3j/c3jsxrpbxkjr76dxdy7dew7yhen2xj2wjurtjwbrtyrpmwq52evm.py", line 5591, in call
+[rank5]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank5]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank5]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank5]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank5]: Use torch.library.opcheck to test your custom op.
+[rank5]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/modded-nanogpt/scoped_medium.py", line 896, in <module>
+[rank1]:     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_tensor.py", line 631, in backward
+[rank1]:     torch.autograd.backward(
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 365, in backward
+[rank1]:     _engine_run_backward(
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank1]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 317, in apply
+[rank1]:     return user_fn(self, *args)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2338, in backward
+[rank1]:     return impl_fn()
+[rank1]:            ^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2324, in impl_fn
+[rank1]:     out = CompiledFunction._backward_impl(ctx, all_args)
+[rank1]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2494, in _backward_impl
+[rank1]:     out = call_func_at_runtime_with_args(
+[rank1]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank1]:     out = normalize_as_list(f(args))
+[rank1]:                             ^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1209, in _fn
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank1]:     return self.current_callable(inputs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/opt/venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3242, in run
+[rank1]:     out = model(new_inputs)
+[rank1]:           ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/tmp/torchinductor_root/z2/cz2mxzutc7m72x7rkkjncd5rgs3qn5azuhiuhivaymv4y6pqbukn.py", line 5591, in call
+[rank1]:     assert_size_stride(buf5, (50304, 1024), (1024, 1), 'torch.ops.nanogpt.mm_backward.default')
+[rank1]: AssertionError: expected size 50304==50304, stride 1==1024 at dim=0; expected size 1024==1024, stride 50304==1 at dim=1
+[rank1]: Error in op: torch.ops.nanogpt.mm_backward.default
+[rank1]: This error most often comes from a incorrect fake (aka meta) kernel for a custom op.
+[rank1]: Use torch.library.opcheck to test your custom op.
+[rank1]: See https://pytorch.org/docs/stable/library.html#torch.library.opcheck
+[rank0]:[W1224 00:17:40.504962424 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W1224 00:17:40.814000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 836 closing signal SIGTERM
+W1224 00:17:40.815000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 837 closing signal SIGTERM
+W1224 00:17:40.815000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 838 closing signal SIGTERM
+W1224 00:17:40.815000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 839 closing signal SIGTERM
+W1224 00:17:40.815000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 841 closing signal SIGTERM
+W1224 00:17:40.815000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 842 closing signal SIGTERM
+W1224 00:17:40.816000 768 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 843 closing signal SIGTERM
+E1224 00:17:42.996000 768 torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 4 (pid: 840) of binary: /opt/venv/bin/python
+Traceback (most recent call last):
+  File "/opt/venv/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/run.py", line 992, in main
+    run(args)
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/run.py", line 983, in run
+    elastic_launch(
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+============================================================
+scoped_medium.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 836)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 836
+[2]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 837)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 837
+[3]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 838)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 838
+[4]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 839)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 839
+[5]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 5 (local_rank: 5)
+  exitcode  : -15 (pid: 841)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 841
+[6]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 6 (local_rank: 6)
+  exitcode  : -15 (pid: 842)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 842
+[7]:
+  time      : 2025-12-24_00:17:42
+  host      : bc1cfdcf6ff7
+  rank      : 7 (local_rank: 7)
+  exitcode  : -15 (pid: 843)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 843
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-12-24_00:17:40
+  host      : bc1cfdcf6ff7
+  rank      : 4 (local_rank: 4)
+  exitcode  : 1 (pid: 840)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

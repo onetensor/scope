@@ -84,7 +84,11 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+    # Match the real kernel's layout: grad_w is returned as a transposed view
+    # with strides (1, out_features), not contiguous (in_features, 1).
+    grad_x = x_f8.to(torch.bfloat16)
+    grad_w = w_f8.to(torch.float32).T.contiguous().T
+    return grad_x, grad_w
 
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
