@@ -551,7 +551,18 @@ class SpectralBias(nn.Module):
             kv_hist = torch.bincount(kv_num_blocks.flatten().to(torch.int64), minlength=self._dbg_kv_unique_hist.numel())
             self._dbg_kv_unique_hist.copy_(kv_hist.to(torch.int32))
 
-        kv_indices = kv_packed[None].contiguous().to(torch.int32)  # [1,H,QB,max_kv]
+        # IMPORTANT: `BlockMask.from_kv_blocks` infers `kv_len` from the last dimension of
+        # `kv_indices` times `BLOCK_SIZE`. We pass full-length K/V tensors into FlexAttention,
+        # so `kv_len` must equal `T`, i.e. the list length must be `num_blocks`.
+        kv_list_len = num_blocks
+        if max_kv >= kv_list_len:
+            kv_indices_h = kv_packed[..., :kv_list_len]
+        else:
+            kv_indices_h = kv_packed.new_empty((H, num_blocks, kv_list_len))
+            kv_indices_h[..., :max_kv] = kv_packed
+            kv_indices_h[..., max_kv:] = kv_packed[..., :1]
+
+        kv_indices = kv_indices_h[None].contiguous().to(torch.int32)  # [1,H,QB,num_blocks]
         kv_num_blocks = kv_num_blocks[None].contiguous()  # [1,H,QB]
         zeros_num = torch.zeros_like(kv_num_blocks)
         zeros_idx = torch.zeros_like(kv_indices)

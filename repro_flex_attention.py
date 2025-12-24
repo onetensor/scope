@@ -26,6 +26,7 @@ def build_sliding_window_blockmask(*, T: int, H: int, block_size: int, window_bl
     assert T % block_size == 0
     num_blocks = T // block_size
     device = torch.device("cuda")
+    window_blocks = min(int(window_blocks), int(num_blocks))
 
     def token_causal(b, h, q_idx, kv_idx):
         q = q_idx.to(torch.long)
@@ -35,9 +36,12 @@ def build_sliding_window_blockmask(*, T: int, H: int, block_size: int, window_bl
     q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int32)  # [QB]
     offs = torch.arange(window_blocks, device=device, dtype=torch.int32)  # [W]
     kv_blocks = (q_blocks[:, None] - offs[None, :]).clamp(min=0)  # [QB,W]
-    kv_num_blocks = torch.full((num_blocks,), window_blocks, device=device, dtype=torch.int32)  # [QB]
+    # Match FlexAttention's expected kv_len=T by making the index list length == num_blocks.
+    kv_indices = torch.zeros((num_blocks, num_blocks), device=device, dtype=torch.int32)  # [QB,QB]
+    kv_indices[:, :window_blocks] = kv_blocks
+    kv_num_blocks = torch.minimum(q_blocks + 1, q_blocks.new_full((num_blocks,), window_blocks))  # [QB]
 
-    kv_indices = kv_blocks[None, None].expand(1, H, num_blocks, window_blocks).contiguous()  # [1,H,QB,W]
+    kv_indices = kv_indices[None, None].expand(1, H, num_blocks, num_blocks).contiguous()  # [1,H,QB,QB]
     kv_num_blocks = kv_num_blocks[None, None].expand(1, H, num_blocks).contiguous()  # [1,H,QB]
     zeros_num = torch.zeros_like(kv_num_blocks)
     zeros_idx = torch.zeros_like(kv_indices)

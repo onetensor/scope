@@ -618,8 +618,10 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 64*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    # NOTE: very long seq lengths can trip FlexAttention/Inductor issues on some PyTorch nightlies.
+    # Use env vars `TRAIN_SEQ_LEN` / `VAL_SEQ_LEN` to override.
+    train_seq_len = 16*1024 # FlexAttention sequence length
+    val_seq_len = train_seq_len # FlexAttention sequence length for validation
     # optimization
     num_iterations = 7050 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
