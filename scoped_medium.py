@@ -326,8 +326,10 @@ class CausalSelfAttention(nn.Module):
                 )
 
             def score_mod(score, b, h, q_idx, kv_idx):
-                q_idx_l = q_idx.to(torch.long)
-                kv_idx_l = kv_idx.to(torch.long)
+                # FlexAttention may call score_mod with q_idx/kv_idx as 0-D tensors during fake/compile.
+                # Reshape to 1-D so [:, None] broadcasts are always valid.
+                q_idx_l = q_idx.to(torch.long).reshape(-1)
+                kv_idx_l = kv_idx.to(torch.long).reshape(-1)
                 delta = (q_idx_l[:, None] - kv_idx_l[None, :]).clamp(min=0, max=T - 1)
                 cos = cos_wD[:, delta].permute(1, 2, 0)
                 sin = sin_wD[:, delta].permute(1, 2, 0)
