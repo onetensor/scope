@@ -86,6 +86,8 @@ You can force pointer masking during validation:
 - `TORCHDYNAMO_VERBOSE=0|1`
 - `TORCHDYNAMO_SUPPRESS_ERRORS=0|1`
 - `TORCH_COMPILE_FALLBACK_TO_EAGER=0|1`
+- `FLEXATTN_DYNAMO_DISABLE=0|1` (graph-break around FlexAttention if needed)
+- `FLEXATTN_COMPILE=0|1` (compile FlexAttention standalone when graph-broken; keeps fused kernel)
 - `LOG_ALL_RANKS=0|1` (write one logfile per rank)
 
 ## Docker / Vast.ai

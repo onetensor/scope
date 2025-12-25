@@ -42,6 +42,11 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
 
+## FlexAttention Controls (env vars)
+
+- `FLEXATTN_DYNAMO_DISABLE=0|1` (graph-break around FlexAttention; use only as a workaround for compiler issues)
+- `FLEXATTN_COMPILE=0|1` (when graph-broken, compile FlexAttention standalone to keep fused kernels)
+
 ### Validation pointer-mask state
 
 Validation uses the same pointer-mask state as training at the current step (scheduled or fixed)

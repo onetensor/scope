@@ -22,8 +22,11 @@ TORCHDYNAMO_SUPPRESS_ERRORS="${TORCHDYNAMO_SUPPRESS_ERRORS:-0}"
 TORCHDYNAMO_VERBOSE="${TORCHDYNAMO_VERBOSE:-0}"
 TORCH_COMPILE_FALLBACK_TO_EAGER="${TORCH_COMPILE_FALLBACK_TO_EAGER:-1}"
 LOG_ALL_RANKS="${LOG_ALL_RANKS:-0}"
-# Default to graph-breaking around FlexAttention to avoid occasional Inductor lowering bugs.
-FLEXATTN_DYNAMO_DISABLE="${FLEXATTN_DYNAMO_DISABLE:-1}"
+# FlexAttention fusion: default to allowing Dynamo capture (fused kernel).
+# Set `FLEXATTN_DYNAMO_DISABLE=1` only if you hit an upstream Inductor lowering bug.
+FLEXATTN_DYNAMO_DISABLE="${FLEXATTN_DYNAMO_DISABLE:-0}"
+# When graph-breaking around FlexAttention, compile it standalone to keep the fused kernel.
+FLEXATTN_COMPILE="${FLEXATTN_COMPILE:-1}"
 
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
 BASE_LOG_DIR="${LOG_DIR:-logs/ablations/${STAMP}}"
@@ -58,6 +61,7 @@ run_one() {
     TORCH_COMPILE_FALLBACK_TO_EAGER="${TORCH_COMPILE_FALLBACK_TO_EAGER}" \
     LOG_ALL_RANKS="${LOG_ALL_RANKS}" \
     FLEXATTN_DYNAMO_DISABLE="${FLEXATTN_DYNAMO_DISABLE}" \
+    FLEXATTN_COMPILE="${FLEXATTN_COMPILE}" \
     "$@"
 }
 

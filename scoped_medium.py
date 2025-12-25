@@ -33,8 +33,37 @@ try:
 except Exception:  # pragma: no cover
     _dynamo = None  # type: ignore[assignment]
 
-def _flex_attention_call(*args, **kwargs):
-    return flex_attention(*args, **kwargs)
+def _flex_attention_eager(q, k, v, *, block_mask, score_mod=None, scale=None):
+    return flex_attention(q, k, v, block_mask=block_mask, score_mod=score_mod, scale=scale)
+
+@lru_cache(maxsize=None)
+def _get_compiled_flex_attention(backend: str, mode: str | None, fullgraph: bool):
+    # Compile FlexAttention as a standalone callable so graph-breaking around it
+    # does not fall back to the unfused reference path (which materializes full
+    # score matrices and is extremely slow/memory-heavy).
+    return torch.compile(
+        _flex_attention_eager,
+        dynamic=False,
+        backend=backend,
+        mode=mode,
+        fullgraph=fullgraph,
+    )
+
+def _flex_attention_call(q, k, v, *, block_mask, score_mod=None, scale=None):
+    # NOTE: this function is typically executed under `_dynamo.disable` when
+    # `FLEXATTN_DYNAMO_DISABLE=1`, so we do not assume any outer compilation.
+    # If enabled, we run a separately-compiled FlexAttention to retain the
+    # fused kernel (and avoid dense score materialization).
+    use_compile = bool(globals().get("args", None) is not None and getattr(args, "flexattn_compile", True))
+    if use_compile and hasattr(torch, "compile"):
+        backend = str(getattr(args, "torch_compile_backend", "inductor"))
+        mode = str(getattr(args, "torch_compile_mode", "default")).strip()
+        if mode.lower() in {"", "none"}:
+            mode = None  # type: ignore[assignment]
+        return _get_compiled_flex_attention(backend, mode, False)(
+            q, k, v, block_mask=block_mask, score_mod=score_mod, scale=scale
+        )
+    return _flex_attention_eager(q, k, v, block_mask=block_mask, score_mod=score_mod, scale=scale)
 
 flex_attention_nocompile = _dynamo.disable(_flex_attention_call) if _dynamo is not None else _flex_attention_call
 
@@ -653,7 +682,7 @@ class Hyperparameters:
     spectral_pointer_global_blocks = 2
     spectral_pointer_qblock_rep = "last"  # "last"|"mean"
     spectral_pointer_schedule = True
-    spectral_pointer_schedule_disable_steps = 300
+    spectral_pointer_schedule_disable_steps = 0 # temporary change to test short ablation runs, change back to 300 or something else
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2
     # Validation override for pointer mask (default: use scheduled state).
@@ -667,9 +696,10 @@ class Hyperparameters:
     scope_log_every = 200 # rank0-only SCOPE debug stats
     save_checkpoint = False
     # logging / diagnostics
-    log_all_ranks = False  # write one logfile per rank (debugging)
+    log_all_ranks = False  # write one logfile per rank (debugging)       
     flexattn_dynamo_disable = False  # graph-break around FlexAttention (compiler workaround)
-    # torch.compile controls (FlexAttention still JITs its own kernels)
+    flexattn_compile = True  # compile FlexAttention standalone when graph-broken (keeps fused kernel)
+    # torch.compile controls (FlexAttention still JITs its own kernels)   
     torch_compile = True
     torch_compile_backend = "inductor"
     torch_compile_mode = "default"  # "default"|"reduce-overhead"|"max-autotune"
@@ -712,9 +742,10 @@ args.num_iterations = _env_int("NUM_ITERATIONS", args.num_iterations)
 args.val_loss_every = _env_int("VAL_LOSS_EVERY", args.val_loss_every)
 args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)
 args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint)
-args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)
+args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)       
 args.flexattn_dynamo_disable = _env_bool("FLEXATTN_DYNAMO_DISABLE", args.flexattn_dynamo_disable)
-args.cooldown_frac = _env_float("COOLDOWN_FRAC", args.cooldown_frac)
+args.flexattn_compile = _env_bool("FLEXATTN_COMPILE", args.flexattn_compile)
+args.cooldown_frac = _env_float("COOLDOWN_FRAC", args.cooldown_frac)      
 args.seed = _env_int("SEED", args.seed)
 
 # SCOPE toggles/knobs.
@@ -737,10 +768,6 @@ args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOC
 args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
 args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
-
-# Default to graph-breaking around FlexAttention when SCOPE is enabled (workaround for occasional Inductor flex_attention lowering bugs).
-if os.environ.get("FLEXATTN_DYNAMO_DISABLE") is None:
-    args.flexattn_dynamo_disable = bool(args.spectral_bias)
 
 # torch.compile toggles/knobs.
 args.torch_compile = _env_bool("TORCH_COMPILE", args.torch_compile)
@@ -853,7 +880,10 @@ print0(
                 dynamo_suppress_errors=bool(args.torch_dynamo_suppress_errors),
                 fallback_to_eager=bool(args.torch_compile_fallback_to_eager),
             ),
-            flexattn=dict(dynamo_disable=bool(args.flexattn_dynamo_disable)),
+            flexattn=dict(
+                dynamo_disable=bool(args.flexattn_dynamo_disable),
+                compile=bool(args.flexattn_compile),
+            ),
             scope=dict(
                 enabled=bool(args.spectral_bias),
                 impl=str(args.spectral_impl),
