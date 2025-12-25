@@ -740,7 +740,8 @@ class Hyperparameters:
     needle_anchor_len = 4
     needle_value_len = 8
     scope_log_every = 200 # rank0-only SCOPE debug stats
-    save_checkpoint = False
+    save_checkpoint = True  # save a weights checkpoint at end of run (rank0)
+    save_optimizers = False  # include optimizer states (large; usually unnecessary)
     load_checkpoint = ""  # optional path to a saved `state_step*.pt` to load model weights from
     # logging / diagnostics
     log_all_ranks = False  # write one logfile per rank (debugging)       
@@ -795,9 +796,10 @@ args.needle_samples_per_distance = _env_int("NEEDLE_SAMPLES_PER_DISTANCE", args.
 args.needle_anchor_len = _env_int("NEEDLE_ANCHOR_LEN", args.needle_anchor_len)
 args.needle_value_len = _env_int("NEEDLE_VALUE_LEN", args.needle_value_len)
 args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)  
-args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint) 
-args.load_checkpoint = _env_str("LOAD_CHECKPOINT", args.load_checkpoint)
-args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)       
+args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint)       
+args.save_optimizers = _env_bool("SAVE_OPTIMIZERS", args.save_optimizers)
+args.load_checkpoint = _env_str("LOAD_CHECKPOINT", args.load_checkpoint)        
+args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)
 args.flexattn_dynamo_disable = _env_bool("FLEXATTN_DYNAMO_DISABLE", args.flexattn_dynamo_disable)
 args.flexattn_compile = _env_bool("FLEXATTN_COMPILE", args.flexattn_compile)
 args.cooldown_frac = _env_float("COOLDOWN_FRAC", args.cooldown_frac)      
@@ -1436,6 +1438,8 @@ for opt in optimizers:
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
+    if args.num_iterations <= 0:
+        return 0.0
     x = step / args.num_iterations # progress in training
     assert 0 <= x < 1
     if x < 1 - args.cooldown_frac:
@@ -1448,8 +1452,11 @@ def get_lr(step: int):
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 def get_window_size_blocks(step: int):
-    x = step / args.num_iterations # progress in training
-    assert 0 <= x <= 1
+    if args.num_iterations <= 0:
+        x = 1.0
+    else:
+        x = step / args.num_iterations # progress in training
+        assert 0 <= x <= 1
     # Linearly increase the block-wise sliding window size over training 128 -> 1792
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
     window_size = next_multiple_of_n(1728 * x, n=128)
@@ -1635,9 +1642,13 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(step=int(step), code=code, model=model.state_dict())
+            if args.save_optimizers:
+                log["optimizers"] = [opt.state_dict() for opt in optimizers]
             os.makedirs(f"{log_dir}/{run_id}", exist_ok=True)
-            torch.save(log, f"{log_dir}/{run_id}/state_step{step:06d}.pt")
+            ckpt_path = f"{log_dir}/{run_id}/state_step{step:06d}.pt"
+            torch.save(log, ckpt_path)
+            print0(json.dumps(dict(tag="CHECKPOINT_SAVED", path=str(ckpt_path), step=int(step))), console=True)
         # the last step only has the validation loop, so break to avoid training
         break
 

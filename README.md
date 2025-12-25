@@ -43,6 +43,7 @@ Useful overrides:
 - `TRAIN_SEQ_LEN=65536` / `VAL_SEQ_LEN=65536`
 - `VAL_LOSS_EVERY=0` (end-only) or a small interval
 - `VAL_TOKENS=10485760`
+- `SAVE_CHECKPOINT=1` (default) to save `state_step*.pt` under `LOG_DIR/<run_id>/`
 
 ### 3-run ablations (recommended)
 

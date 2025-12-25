@@ -49,6 +49,11 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP=<int>`
 - `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS=<int>`
 
+## Checkpointing
+
+- `SAVE_CHECKPOINT=0|1` (default `1`) saves a `state_step*.pt` at the end of the run (rank0 only)
+- `SAVE_OPTIMIZERS=0|1` (default `0`) additionally includes optimizer states (large; usually unnecessary)
+
 ## FlexAttention Controls (env vars)
 
 - `FLEXATTN_DYNAMO_DISABLE=0|1` (graph-break around FlexAttention; use only as a workaround for compiler issues)
