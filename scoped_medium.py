@@ -703,12 +703,16 @@ class Hyperparameters:
     spectral_width_max = 256.0
     spectral_delta_star_max = None  # None -> use L_max
     spectral_use_pointer_mask = True
-    spectral_pointer_local_blocks = 16
+    spectral_pointer_local_blocks = 12
     spectral_pointer_half_blocks = 4
-    spectral_pointer_global_blocks = 2
+    # Global anchors are a training stability aid but can cause "block0 collapse" if left on.
+    # Default: warmup with 2 blocks, then drop to 0 so pointers must learn nontrivial retrieval.
+    spectral_pointer_global_blocks = 0
+    spectral_pointer_global_blocks_warmup = 2
+    spectral_pointer_global_blocks_warmup_steps = 300
     spectral_pointer_qblock_rep = "last"  # "last"|"mean"
     spectral_pointer_schedule = True
-    spectral_pointer_schedule_disable_steps = 200 # temporary change to test short ablation runs, change back to 300 or something else (0 starts pointer mask immediately)
+    spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2
     # Validation override for pointer mask (default: use scheduled state).
@@ -811,6 +815,8 @@ args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOC
 args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
 args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
+args.spectral_pointer_global_blocks_warmup = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP", args.spectral_pointer_global_blocks_warmup)
+args.spectral_pointer_global_blocks_warmup_steps = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS", args.spectral_pointer_global_blocks_warmup_steps)
 
 # torch.compile toggles/knobs.
 args.torch_compile = _env_bool("TORCH_COMPILE", args.torch_compile)
@@ -947,6 +953,8 @@ print0(
                 pointer_local_blocks=int(args.spectral_pointer_local_blocks),
                 pointer_half_blocks=int(args.spectral_pointer_half_blocks),
                 pointer_global_blocks=int(args.spectral_pointer_global_blocks),
+                pointer_global_blocks_warmup=int(args.spectral_pointer_global_blocks_warmup),
+                pointer_global_blocks_warmup_steps=int(args.spectral_pointer_global_blocks_warmup_steps),
                 val_force=bool(args.spectral_pointer_val_force),
                 val_half_blocks=int(args.spectral_pointer_val_half_blocks),
             ),
@@ -990,7 +998,10 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
                            use_pointer_mask=args.spectral_use_pointer_mask,
                            pointer_local_blocks=args.spectral_pointer_local_blocks,
                            pointer_half_blocks=args.spectral_pointer_half_blocks,
-                           pointer_global_blocks=args.spectral_pointer_global_blocks,
+                            pointer_global_blocks=max(
+                                int(args.spectral_pointer_global_blocks),
+                                int(args.spectral_pointer_global_blocks_warmup),
+                            ),
                            pointer_qblock_rep=args.spectral_pointer_qblock_rep,
                            lambda_omega=args.spectral_lambda_omega,
                            lambda_zero_mean=args.spectral_lambda_zero_mean,
@@ -1062,31 +1073,48 @@ if master_process and spectral_bias_modules:
         ),
         console=True,
     )
-pointer_mask_state = dict(enabled=None, half_blocks=None)
+pointer_mask_state = dict(enabled=None, half_blocks=None, global_blocks=None)
 def maybe_update_pointer_mask(step: int):
     if not spectral_bias_modules:
         return
     if not args.spectral_use_pointer_mask:
         enabled = False
         half_blocks = 0
+        global_blocks = 0
     elif not args.spectral_pointer_schedule:
         enabled = True
         half_blocks = int(args.spectral_pointer_half_blocks)
+        global_blocks = int(args.spectral_pointer_global_blocks)
     elif step < args.spectral_pointer_schedule_disable_steps:
         enabled = False
         half_blocks = 0
+        global_blocks = int(args.spectral_pointer_global_blocks_warmup)
     elif step < args.spectral_pointer_schedule_mid_steps:
         enabled = True
         half_blocks = min(int(args.spectral_pointer_schedule_half_blocks_mid), int(args.spectral_pointer_half_blocks))
+        global_blocks = int(args.spectral_pointer_global_blocks_warmup)
     else:
         enabled = True
         half_blocks = int(args.spectral_pointer_half_blocks)
-    if pointer_mask_state["enabled"] == enabled and pointer_mask_state["half_blocks"] == half_blocks:
+        global_blocks = int(args.spectral_pointer_global_blocks)
+    # Independently schedule global anchors (warmup -> off) to avoid block0 collapse.
+    if args.spectral_use_pointer_mask:
+        if step < int(args.spectral_pointer_global_blocks_warmup_steps):
+            global_blocks = int(args.spectral_pointer_global_blocks_warmup)
+        else:
+            global_blocks = int(args.spectral_pointer_global_blocks)
+
+    if (
+        pointer_mask_state["enabled"] == enabled
+        and pointer_mask_state["half_blocks"] == half_blocks
+        and pointer_mask_state["global_blocks"] == global_blocks
+    ):
         return
     for sb in spectral_bias_modules:
-        sb.set_pointer_mask_state(enabled=enabled, half_blocks=half_blocks)
+        sb.set_pointer_mask_state(enabled=enabled, half_blocks=half_blocks, global_blocks=global_blocks)
     pointer_mask_state["enabled"] = enabled
     pointer_mask_state["half_blocks"] = half_blocks
+    pointer_mask_state["global_blocks"] = global_blocks
 
 def _hist_percentile(hist: Tensor, q: float) -> int | None:
     total = int(hist.sum().item())
@@ -1146,11 +1174,15 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         step=int(step),
         train_loss=(float(train_loss.item()) if train_loss is not None else None),
         sliding_window_blocks=int(sliding_window_blocks) if sliding_window_blocks is not None else None,
-        pointer_mask=dict(enabled=bool(pointer_mask_state["enabled"]), half_blocks=int(pointer_mask_state["half_blocks"])),
+        pointer_mask=dict(
+            enabled=bool(pointer_mask_state["enabled"]),
+            half_blocks=int(pointer_mask_state["half_blocks"]),
+            global_blocks=int(pointer_mask_state["global_blocks"]),
+        ),
         pointer_cfg=dict(
             local_blocks=int(sb0.pointer_local_blocks),
             half_blocks_max=int(sb0.pointer_half_blocks),
-            global_blocks=int(sb0.pointer_global_blocks),
+            global_blocks_max=int(sb0.pointer_global_blocks),
             qblock_rep=str(sb0.pointer_qblock_rep),
         ),
         kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, max=kv_max),

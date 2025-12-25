@@ -133,6 +133,11 @@ class SpectralBias(nn.Module):
             torch.tensor(self.pointer_half_blocks if self.use_pointer_mask else 0, dtype=torch.int32),
             persistent=False,
         )
+        self.register_buffer(
+            "_pointer_global_blocks_active",
+            torch.tensor(self.pointer_global_blocks if self.use_pointer_mask else 0, dtype=torch.int32),
+            persistent=False,
+        )
 
         self.lambda_omega = float(lambda_omega)
         self.lambda_zero_mean = float(lambda_zero_mean)
@@ -202,17 +207,20 @@ class SpectralBias(nn.Module):
 
     def _init_outputs(self):
         # Initialize the output head to start near "no-op" + local Δ* (stability).
-        delta_bias = -6.0  # sigmoid ~ 0.0025 -> small Δ* initially
+        # Break symmetry across pointers so π can get gradients (otherwise identical
+        # components make π irrelevant and it stays exactly uniform).
+        delta_biases = torch.linspace(-6.0, -4.0, steps=self.M)  # small Δ* initially (all within local band)
         with torch.no_grad():
             if self.share_across_heads:
                 out: nn.Linear = self.mlp[-1]
                 out.weight.zero_()
                 out.bias.zero_()
-                out.bias[: self.M].fill_(delta_bias)  # delta_raw
+                out.bias[: self.M].copy_(delta_biases.to(device=out.bias.device, dtype=out.bias.dtype))  # delta_raw
             else:
                 self.w2.zero_()
                 self.b2.zero_()
-                self.b2[:, : self.M].fill_(delta_bias)
+                biases = delta_biases.to(device=self.b2.device, dtype=self.b2.dtype).view(1, self.M).expand(self.num_heads, -1)
+                self.b2[:, : self.M].copy_(biases)
 
     def _mlp_forward(self, q: Tensor) -> Tensor:
         if self.detach_q:
@@ -250,13 +258,19 @@ class SpectralBias(nn.Module):
         self._sin_wD = sin_wD
         return cos_wD, sin_wD, self._cos_mean, self._sin_mean
 
-    def set_pointer_mask_state(self, *, enabled: bool, half_blocks: int):
+    def set_pointer_mask_state(self, *, enabled: bool, half_blocks: int, global_blocks: int | None = None):
         half_blocks = int(half_blocks)
         if half_blocks < 0:
             raise ValueError("half_blocks must be >= 0")
         half_blocks = min(half_blocks, self.pointer_half_blocks)
         self._pointer_mask_active.fill_(1 if enabled else 0)
         self._pointer_half_blocks_active.fill_(half_blocks)
+        if global_blocks is not None:
+            gb = int(global_blocks)
+            if gb < 0:
+                raise ValueError("global_blocks must be >= 0")
+            gb = min(gb, self.pointer_global_blocks)
+            self._pointer_global_blocks_active.fill_(gb)
 
     def forward(
         self,
@@ -463,6 +477,7 @@ class SpectralBias(nn.Module):
             assert input_seq is not None and input_seq.ndim == 1
             docs = (input_seq == eod_token_id).cumsum(0)
         assert docs is not None and docs.ndim == 1
+        device = docs.device
         T = int(docs.numel())
         assert T % block_size == 0
         B, H, TT, M = delta_star.shape
@@ -473,13 +488,10 @@ class SpectralBias(nn.Module):
 
         local_blocks = self.pointer_local_blocks if local_blocks is None else int(local_blocks)
         ptr_half_blocks = self.pointer_half_blocks if ptr_half_blocks is None else int(ptr_half_blocks)
-        global_blocks = self.pointer_global_blocks if global_blocks is None else int(global_blocks)
         local_blocks = max(1, local_blocks)
         ptr_half_blocks = max(0, ptr_half_blocks)
-        global_blocks = max(0, global_blocks)
 
         num_blocks = T // block_size
-        device = docs.device
 
         def document_causal(b, h, q_idx, kv_idx):
             q = q_idx.to(torch.long)
@@ -527,10 +539,18 @@ class SpectralBias(nn.Module):
             pieces.append(ptr_center_blk)  # [H,QB,M]
 
         # (3) global anchors: first N blocks
-        if global_blocks > 0:
-            g = torch.arange(min(global_blocks, num_blocks), device=device, dtype=torch.int32)
+        global_max = min(self.pointer_global_blocks, num_blocks)
+        if global_max > 0:
+            g = torch.arange(global_max, device=device, dtype=torch.int32)
             g = g[None, None, :].expand(H, num_blocks, -1)
             g = torch.minimum(g, q_blocks[None, :, None])
+            if global_blocks is None:
+                gb_active = self._pointer_global_blocks_active.to(device=device, dtype=torch.int32)
+            else:
+                gb_active = torch.tensor(int(global_blocks), device=device, dtype=torch.int32)
+            gb_active = torch.clamp(gb_active, min=0, max=global_max)
+            active = torch.arange(global_max, device=device, dtype=torch.int32) < gb_active
+            g = torch.where(active[None, None, :], g, q_blocks[None, :, None].expand(H, num_blocks, global_max))
             pieces.append(g)
 
         kv_blocks = torch.cat(pieces, dim=-1)  # [H,QB,MAX_KV]

@@ -41,6 +41,8 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
+- `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=<int>`
+- `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=<int>`
 
 ## FlexAttention Controls (env vars)
 
