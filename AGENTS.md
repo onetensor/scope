@@ -43,6 +43,11 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=<int>`
+- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE=0|1` (active cap on Δ*; reduces saturation to 0/max)
+- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MIN=<int>` (`-1` -> `SPECTRAL_L_TRAIN-1` default)
+- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MAX=<int>` (`-1` -> `max(TRAIN_SEQ_LEN,VAL_SEQ_LEN)-1` default)
+- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP=<int>`
+- `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS=<int>`
 
 ## FlexAttention Controls (env vars)
 
@@ -62,8 +67,8 @@ unless forced:
 `scoped_medium.py` emits JSON:
 
 - `SCOPE_BINS`: bin edges at startup.
-- `SCOPE_STATS`: every `SCOPE_LOG_EVERY` steps (KV unique-block stats, pointer behavior proxies,
-  `pi` entropy, and regularizer magnitudes).
+- `SCOPE_STATS`: every `SCOPE_LOG_EVERY` steps (KV unique-block stats + pointer behavior proxies like
+  `ptr_center_block0_frac_excl` / `ptr_center_docstart_frac`, plus `delta_star_max_active`, `pi` entropy, and regularizers).
 - `NEEDLE_EVAL`: optional synthetic NIAH retrieval eval (by distance), gated by `NEEDLE_EVAL=1`.
 
 ## Current Blocker / Debug Context

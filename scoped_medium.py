@@ -356,7 +356,7 @@ class CausalSelfAttention(nn.Module):
                 cos_wD,
                 sin_wD,
                 reg_loss,
-            ) = self.spectral_bias(q_for_bias)
+            ) = self.spectral_bias(q_for_bias, docs=docs)
             beta = float(self.spectral_bias.beta)
             use_slope = bool(self.spectral_bias.use_slope)
             subtract_b0 = bool(self.spectral_bias.subtract_b0)
@@ -702,6 +702,14 @@ class Hyperparameters:
     spectral_width_min = 32.0
     spectral_width_max = 256.0
     spectral_delta_star_max = None  # None -> use L_max
+    # Schedule an active cap on Δ* (token offsets) during training to avoid early
+    # saturation to the extremes (0 / max), which often shows up as "block0
+    # collapse" + max-distance collapse in telemetry.
+    spectral_delta_star_max_schedule = True
+    spectral_delta_star_max_schedule_start_step = 0
+    spectral_delta_star_max_schedule_steps = 4000
+    spectral_delta_star_max_schedule_min = -1  # <0 -> use spectral_L_train - 1
+    spectral_delta_star_max_schedule_max = -1  # <0 -> use max(train,val) - 1
     spectral_use_pointer_mask = True
     spectral_pointer_local_blocks = 12
     spectral_pointer_half_blocks = 4
@@ -817,6 +825,11 @@ args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", arg
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
 args.spectral_pointer_global_blocks_warmup = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP", args.spectral_pointer_global_blocks_warmup)
 args.spectral_pointer_global_blocks_warmup_steps = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS", args.spectral_pointer_global_blocks_warmup_steps)
+args.spectral_delta_star_max_schedule = _env_bool("SPECTRAL_DELTA_STAR_MAX_SCHEDULE", args.spectral_delta_star_max_schedule)
+args.spectral_delta_star_max_schedule_start_step = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP", args.spectral_delta_star_max_schedule_start_step)
+args.spectral_delta_star_max_schedule_steps = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS", args.spectral_delta_star_max_schedule_steps)
+args.spectral_delta_star_max_schedule_min = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MIN", args.spectral_delta_star_max_schedule_min)
+args.spectral_delta_star_max_schedule_max = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MAX", args.spectral_delta_star_max_schedule_max)
 
 # torch.compile toggles/knobs.
 args.torch_compile = _env_bool("TORCH_COMPILE", args.torch_compile)
@@ -830,6 +843,12 @@ args.torch_compile_fallback_to_eager = _env_bool("TORCH_COMPILE_FALLBACK_TO_EAGE
 # Derived defaults that should reflect env overrides.
 if os.environ.get("NEEDLE_SEQ_LEN") is None:
     args.needle_seq_len = args.val_seq_len
+if args.spectral_delta_star_max_schedule_min < 0:
+    args.spectral_delta_star_max_schedule_min = int(args.spectral_L_train) - 1
+if args.spectral_delta_star_max_schedule_max < 0:
+    args.spectral_delta_star_max_schedule_max = max(int(args.train_seq_len), int(args.val_seq_len)) - 1
+if args.spectral_delta_star_max_schedule_min > args.spectral_delta_star_max_schedule_max:
+    args.spectral_delta_star_max_schedule_min = int(args.spectral_delta_star_max_schedule_max)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -948,6 +967,14 @@ print0(
                 use_slope=bool(args.spectral_use_slope),
                 ramp_lambda=float(args.spectral_ramp_lambda),
                 gate_kind=str(args.spectral_gate_kind),
+                delta_star=dict(
+                    hard_cap=int(args.spectral_L_max if args.spectral_delta_star_max is None else args.spectral_delta_star_max),
+                    schedule=bool(args.spectral_delta_star_max_schedule),
+                    schedule_start=int(args.spectral_delta_star_max_schedule_start_step),
+                    schedule_steps=int(args.spectral_delta_star_max_schedule_steps),
+                    schedule_min=int(args.spectral_delta_star_max_schedule_min),
+                    schedule_max=int(args.spectral_delta_star_max_schedule_max),
+                ),
                 use_pointer_mask=bool(args.spectral_use_pointer_mask),
                 pointer_schedule=bool(args.spectral_pointer_schedule),
                 pointer_local_blocks=int(args.spectral_pointer_local_blocks),
@@ -1073,7 +1100,7 @@ if master_process and spectral_bias_modules:
         ),
         console=True,
     )
-pointer_mask_state = dict(enabled=None, half_blocks=None, global_blocks=None)
+pointer_mask_state = dict(enabled=None, half_blocks=None, global_blocks=None)   
 def maybe_update_pointer_mask(step: int):
     if not spectral_bias_modules:
         return
@@ -1116,6 +1143,38 @@ def maybe_update_pointer_mask(step: int):
     pointer_mask_state["half_blocks"] = half_blocks
     pointer_mask_state["global_blocks"] = global_blocks
 
+delta_star_max_state = dict(max_tokens=None)
+def maybe_update_delta_star_max(step: int):
+    if not spectral_bias_modules:
+        return
+    if not args.spectral_bias:
+        return
+
+    if not args.spectral_delta_star_max_schedule:
+        desired = int(args.spectral_L_max if args.spectral_delta_star_max is None else args.spectral_delta_star_max)
+    else:
+        start = int(args.spectral_delta_star_max_schedule_start_step)
+        steps = int(args.spectral_delta_star_max_schedule_steps)
+        min_cap = int(args.spectral_delta_star_max_schedule_min)
+        max_cap = int(args.spectral_delta_star_max_schedule_max)
+        if step < start:
+            desired = min_cap
+        elif steps <= 0:
+            desired = max_cap
+        else:
+            t = (step - start) / float(steps)
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            desired = int(round(min_cap + t * (max_cap - min_cap)))
+    desired = max(0, desired)
+    hard_cap = int(args.spectral_L_max if args.spectral_delta_star_max is None else args.spectral_delta_star_max)
+    desired = min(desired, hard_cap)
+
+    if delta_star_max_state["max_tokens"] == desired:
+        return
+    for sb in spectral_bias_modules:
+        sb.set_delta_star_max_active(max_tokens=desired)
+    delta_star_max_state["max_tokens"] = desired
+
 def _hist_percentile(hist: Tensor, q: float) -> int | None:
     total = int(hist.sum().item())
     if total <= 0:
@@ -1143,9 +1202,10 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         kv_mean = float((ks * kv_hist.float()).sum().item() / kv_total)
         kv_p50 = _hist_percentile(kv_hist, 0.50)
         kv_p90 = _hist_percentile(kv_hist, 0.90)
-        kv_max = int(torch.nonzero(kv_hist, as_tuple=False).max().item())
+        kv_min = int(torch.nonzero(kv_hist, as_tuple=False).min().item())
+        kv_max = int(torch.nonzero(kv_hist, as_tuple=False).max().item())       
     else:
-        kv_mean, kv_p50, kv_p90, kv_max = None, None, None, None
+        kv_mean, kv_p50, kv_p90, kv_min, kv_max = None, None, None, None, None
 
     dt_hist = sum((sb._dbg_delta_tokens_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_tokens_hist))
     db_hist = sum((sb._dbg_delta_blocks_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_blocks_hist))
@@ -1162,6 +1222,8 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
 
     outside_fracs = torch.stack([sb._dbg_ptr_outside_local_frac for sb in sbs]).float()
     block0_fracs = torch.stack([sb._dbg_ptr_block0_frac for sb in sbs]).float()
+    block0_excl_fracs = torch.stack([sb._dbg_ptr_block0_frac_excl for sb in sbs]).float()
+    docstart_fracs = torch.stack([sb._dbg_ptr_docstart_frac for sb in sbs]).float()
     pi_entropies = torch.stack([sb._dbg_pi_entropy_mean for sb in sbs]).float()
 
     reg_omega = float(torch.stack([sb._dbg_reg_omega for sb in sbs]).sum().item())
@@ -1185,9 +1247,20 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             global_blocks_max=int(sb0.pointer_global_blocks),
             qblock_rep=str(sb0.pointer_qblock_rep),
         ),
-        kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, max=kv_max),
+        delta_star_max_active=(int(delta_star_max_state["max_tokens"]) if delta_star_max_state.get("max_tokens") is not None else None),
+        kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, min=kv_min, max=kv_max),
         ptr_outside_local_frac=dict(mean=float(outside_fracs.mean().item()), min=float(outside_fracs.min().item()), max=float(outside_fracs.max().item())),
         ptr_center_block0_frac=dict(mean=float(block0_fracs.mean().item()), min=float(block0_fracs.min().item()), max=float(block0_fracs.max().item())),
+        ptr_center_block0_frac_excl=dict(
+            mean=float(block0_excl_fracs.mean().item()),
+            min=float(block0_excl_fracs.min().item()),
+            max=float(block0_excl_fracs.max().item()),
+        ),
+        ptr_center_docstart_frac=dict(
+            mean=float(docstart_fracs.mean().item()),
+            min=float(docstart_fracs.min().item()),
+            max=float(docstart_fracs.max().item()),
+        ),
         pi_entropy_mean=dict(mean=float(pi_entropies.mean().item()), min=float(pi_entropies.min().item()), max=float(pi_entropies.max().item())),
         reg=dict(omega=reg_omega, entropy=reg_entropy, zero_mean=reg_zero_mean, total=reg_total),
         delta_tokens_hist=_to_frac_list(dt_hist, dt_total),
@@ -1383,6 +1456,7 @@ def get_window_size_blocks(step: int):
     return get_window_size_blocks_helper(window_size)
 
 maybe_update_pointer_mask(0)
+maybe_update_delta_star_max(0)
 compile_enabled = bool(args.torch_compile)
 if compile_enabled:
     try:
@@ -1516,6 +1590,7 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     maybe_update_pointer_mask(step)
+    maybe_update_delta_star_max(step)
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------

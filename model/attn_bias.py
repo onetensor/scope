@@ -138,6 +138,12 @@ class SpectralBias(nn.Module):
             torch.tensor(self.pointer_global_blocks if self.use_pointer_mask else 0, dtype=torch.int32),
             persistent=False,
         )
+        # Active clamp on Δ* in tokens (scheduled by the training loop).
+        self.register_buffer(
+            "_delta_star_max_active",
+            torch.tensor(self.delta_star_max, dtype=torch.int32),
+            persistent=False,
+        )
 
         self.lambda_omega = float(lambda_omega)
         self.lambda_zero_mean = float(lambda_zero_mean)
@@ -177,6 +183,8 @@ class SpectralBias(nn.Module):
         self.register_buffer("_dbg_kv_unique_hist", torch.zeros(max_kv + 1, dtype=torch.int32), persistent=False)
         self.register_buffer("_dbg_ptr_outside_local_frac", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_ptr_block0_frac", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_ptr_block0_frac_excl", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_ptr_docstart_frac", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_pi_entropy_mean", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_reg_omega", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_reg_entropy", torch.zeros((), dtype=torch.float32), persistent=False)
@@ -272,9 +280,18 @@ class SpectralBias(nn.Module):
             gb = min(gb, self.pointer_global_blocks)
             self._pointer_global_blocks_active.fill_(gb)
 
+    def set_delta_star_max_active(self, *, max_tokens: int):
+        max_tokens = int(max_tokens)
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be >= 0")
+        max_tokens = min(max_tokens, int(self.delta_star_max))
+        self._delta_star_max_active.fill_(max_tokens)
+
     def forward(
         self,
         q: Tensor,
+        *,
+        docs: Tensor | None = None,
     ) -> tuple[Tensor, ...]:
         """
         q: [B, H, L, d_head] (projected per-head query vectors, before attention)
@@ -326,8 +343,9 @@ class SpectralBias(nn.Module):
             offs += 1
 
         # Δ* is a distance in tokens.
-        delta_max = float(min(L - 1, self.delta_star_max))
-        delta_star = torch.sigmoid(delta_raw) * delta_max  # [B,H,L,M]
+        delta_cap = self._delta_star_max_active.to(device=device, dtype=torch.float32)
+        delta_cap = torch.clamp(delta_cap, min=0.0, max=float(L - 1))
+        delta_star = torch.sigmoid(delta_raw) * delta_cap  # [B,H,L,M]
 
         # μ is mean of log(ω); bound to [log(w_min), log(w_max)] for stability.
         logw_min = self.logw_min.to(device=device)
@@ -417,15 +435,37 @@ class SpectralBias(nn.Module):
                 ptr_center_blk = torch.floor_divide(key_tok.to(torch.int64), block_size)
                 ptr_center_blk = torch.minimum(ptr_center_blk, q_blocks[None, :, None])
 
+                # Doc-aware clamp: avoid wasting pointer budget pointing before the current doc
+                # (those entries are masked out anyway). This reduces apparent block-0 collapse.
+                if docs is not None:
+                    docs_rep = docs[t_rep.to(torch.long)].to(torch.int64)  # [QB]
+                    doc_change = torch.ones_like(docs_rep, dtype=torch.bool)
+                    doc_change[1:] = docs_rep[1:] != docs_rep[:-1]
+                    doc_starts = torch.where(doc_change, q_blocks, torch.zeros_like(q_blocks))
+                    doc_start_blk = doc_starts.cummax(dim=0).values  # [QB]
+                    ptr_center_blk = torch.maximum(ptr_center_blk, doc_start_blk[None, :, None])
+                    self._dbg_ptr_docstart_frac.copy_((ptr_center_blk == doc_start_blk[None, :, None]).float().mean())
+                else:
+                    self._dbg_ptr_docstart_frac.zero_()
+
                 pc_idx = torch.bucketize(ptr_center_blk.flatten(), self._dbg_block_edges, right=False)
                 pc_hist = torch.bincount(pc_idx, minlength=self._dbg_ptr_center_hist.numel()).to(torch.int32)
                 self._dbg_ptr_center_hist.copy_(pc_hist)
 
                 local_blocks = min(self.pointer_local_blocks, num_blocks)
                 local_start = (q_blocks - (local_blocks - 1)).clamp(min=0)
+                if docs is not None:
+                    local_start = torch.maximum(local_start, doc_start_blk)
                 outside = ptr_center_blk < local_start[None, :, None]
                 self._dbg_ptr_outside_local_frac.copy_(outside.float().mean())
                 self._dbg_ptr_block0_frac.copy_((ptr_center_blk == 0).float().mean())
+                # Exclude the first few query blocks where block-0 is often unavoidable.
+                excl = 4
+                if num_blocks > excl:
+                    sub = ptr_center_blk[:, excl:, :]
+                    self._dbg_ptr_block0_frac_excl.copy_((sub == 0).float().mean())
+                else:
+                    self._dbg_ptr_block0_frac_excl.zero_()
 
                 entropy = -(pi_rep * (pi_rep + self.eps).log()).sum(dim=-1)  # [H,QB]
                 self._dbg_pi_entropy_mean.copy_(entropy.mean())
@@ -500,9 +540,17 @@ class SpectralBias(nn.Module):
             document_mask = docs[q] == docs[k]
             return causal_mask & document_mask
 
-        q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int32)
+        q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int32)   
         t_rep = (q_blocks + 1) * block_size - 1  # [QB]
         t_rep_l = t_rep.to(torch.long)
+        # Per-query-block start of the current document (in blocks). This is used to
+        # avoid wasting KV budget on blocks that will be masked out by the doc-aware
+        # token-level `mask_mod`.
+        docs_rep = docs[t_rep_l].to(torch.int64)  # [QB]
+        doc_change = torch.ones_like(docs_rep, dtype=torch.bool)
+        doc_change[1:] = docs_rep[1:] != docs_rep[:-1]
+        doc_starts = torch.where(doc_change, q_blocks, torch.zeros_like(q_blocks))
+        doc_start_blk = doc_starts.cummax(dim=0).values  # [QB]
         ptr_enabled = self._pointer_mask_active.to(device=device, dtype=torch.int32)
         ptr_half_active = self._pointer_half_blocks_active.to(device=device, dtype=torch.int32)
 
@@ -517,6 +565,7 @@ class SpectralBias(nn.Module):
         ptr_center_blk = torch.floor_divide(key_tok.to(torch.int64), block_size).to(torch.int32)  # [H,QB,M]
         ptr_center_blk = torch.minimum(ptr_center_blk, q_blocks[None, :, None])
         ptr_center_blk = torch.where(ptr_enabled.bool(), ptr_center_blk, q_blocks[None, :, None].expand(H, -1, M))
+        ptr_center_blk = torch.maximum(ptr_center_blk, doc_start_blk[None, :, None])
 
         pieces = []
 
@@ -524,6 +573,7 @@ class SpectralBias(nn.Module):
         local_blocks = min(local_blocks, num_blocks)
         offs_local = torch.arange(local_blocks, device=device, dtype=torch.int32)
         local = (q_blocks[None, :, None] - offs_local[None, None, :]).clamp(min=0)
+        local = torch.maximum(local, doc_start_blk[None, :, None])
         pieces.append(local.expand(H, -1, -1))
 
         # (2) pointer windows around each Δ*_m: [center-p ... center+p]
@@ -533,6 +583,7 @@ class SpectralBias(nn.Module):
             ptr = ptr_center_blk[:, :, :, None] + offs_ptr[None, None, None, :]
             ptr = ptr.clamp(min=0, max=num_blocks - 1)
             ptr = torch.minimum(ptr, q_blocks[None, :, None, None])
+            ptr = torch.maximum(ptr, doc_start_blk[None, :, None, None])
             ptr = torch.where(active[None, None, None, :], ptr, ptr_center_blk[:, :, :, None])
             pieces.append(ptr.flatten(2, 3))  # [H,QB,M*(2p+1)]
         else:
@@ -541,9 +592,10 @@ class SpectralBias(nn.Module):
         # (3) global anchors: first N blocks
         global_max = min(self.pointer_global_blocks, num_blocks)
         if global_max > 0:
+            # Doc-local anchors: doc_start_blk + [0..G-1], clamped by causality.
             g = torch.arange(global_max, device=device, dtype=torch.int32)
-            g = g[None, None, :].expand(H, num_blocks, -1)
-            g = torch.minimum(g, q_blocks[None, :, None])
+            g = doc_start_blk[None, :, None] + g[None, None, :]
+            g = torch.minimum(g, q_blocks[None, :, None]).expand(H, -1, -1)
             if global_blocks is None:
                 gb_active = self._pointer_global_blocks_active.to(device=device, dtype=torch.int32)
             else:
