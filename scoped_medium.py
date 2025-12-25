@@ -571,7 +571,15 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(
+        self,
+        input_seq: Tensor,
+        target_seq: Tensor,
+        sliding_window_num_blocks: Tensor,
+        *,
+        logit_positions: Tensor | None = None,
+        return_metrics: bool = False,
+    ):
         assert input_seq.ndim == 1
         docs = (input_seq == 50256).cumsum(0)
 
@@ -600,13 +608,31 @@ class GPT(nn.Module):
                 skip_connections.append(x)
 
         x = norm(x)
-        logits = self.lm_head(x)
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        if logit_positions is None:
+            logits = self.lm_head(x)
+            # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+            logits = 30 * torch.sigmoid(logits.float() / 7.5)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+            if self.training:
+                loss = loss + reg_loss
+            return loss
+
+        # Subset logits path (used by long-context evals): avoid materializing [T,V] logits when only a few positions are needed.
+        assert logit_positions.ndim == 1
+        logit_positions = logit_positions.to(dtype=torch.long)
+        x_sel = x[:, logit_positions]  # [1, N, D]
+        logits = self.lm_head(x_sel)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        targets_sel = target_seq[logit_positions]  # [N]
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_sel)
         if self.training:
             loss = loss + reg_loss
-        return loss
+        if not return_metrics:
+            return loss
+        preds = logits.argmax(dim=-1).view(-1).to(dtype=targets_sel.dtype)
+        token_acc = (preds == targets_sel).float().mean()
+        exact_match = (preds == targets_sel).all().float()
+        return loss, token_acc, exact_match
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -682,7 +708,7 @@ class Hyperparameters:
     spectral_pointer_global_blocks = 2
     spectral_pointer_qblock_rep = "last"  # "last"|"mean"
     spectral_pointer_schedule = True
-    spectral_pointer_schedule_disable_steps = 0 # temporary change to test short ablation runs, change back to 300 or something else
+    spectral_pointer_schedule_disable_steps = 200 # temporary change to test short ablation runs, change back to 300 or something else (0 starts pointer mask immediately)
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2
     # Validation override for pointer mask (default: use scheduled state).
@@ -693,8 +719,17 @@ class Hyperparameters:
     spectral_lambda_entropy = 1e-4
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    # Needle-in-a-haystack (synthetic copy/key-value) eval (SPEC.md §8B)
+    needle_eval = False  # run NIAH eval at end (or every N steps)
+    needle_eval_every = 0  # 0 -> only at end
+    needle_seq_len = val_seq_len  # eval context length (must be divisible by 128 and <= max_seq_len)
+    needle_distances = "4096,8192,16384,32768"  # comma-separated token distances between needle and query
+    needle_samples_per_distance = 8
+    needle_anchor_len = 4
+    needle_value_len = 8
     scope_log_every = 200 # rank0-only SCOPE debug stats
     save_checkpoint = False
+    load_checkpoint = ""  # optional path to a saved `state_step*.pt` to load model weights from
     # logging / diagnostics
     log_all_ranks = False  # write one logfile per rank (debugging)       
     flexattn_dynamo_disable = False  # graph-break around FlexAttention (compiler workaround)
@@ -738,10 +773,18 @@ args.val_files = _env_str("VAL_FILES", args.val_files)
 args.val_tokens = _env_int("VAL_TOKENS", args.val_tokens)
 args.train_seq_len = _env_int("TRAIN_SEQ_LEN", args.train_seq_len)
 args.val_seq_len = _env_int("VAL_SEQ_LEN", args.val_seq_len)
-args.num_iterations = _env_int("NUM_ITERATIONS", args.num_iterations)
-args.val_loss_every = _env_int("VAL_LOSS_EVERY", args.val_loss_every)
-args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)
-args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint)
+args.num_iterations = _env_int("NUM_ITERATIONS", args.num_iterations)     
+args.val_loss_every = _env_int("VAL_LOSS_EVERY", args.val_loss_every)     
+args.needle_eval = _env_bool("NEEDLE_EVAL", args.needle_eval)
+args.needle_eval_every = _env_int("NEEDLE_EVAL_EVERY", args.needle_eval_every)
+args.needle_seq_len = _env_int("NEEDLE_SEQ_LEN", args.needle_seq_len)
+args.needle_distances = _env_str("NEEDLE_DISTANCES", args.needle_distances)
+args.needle_samples_per_distance = _env_int("NEEDLE_SAMPLES_PER_DISTANCE", args.needle_samples_per_distance)
+args.needle_anchor_len = _env_int("NEEDLE_ANCHOR_LEN", args.needle_anchor_len)
+args.needle_value_len = _env_int("NEEDLE_VALUE_LEN", args.needle_value_len)
+args.scope_log_every = _env_int("SCOPE_LOG_EVERY", args.scope_log_every)  
+args.save_checkpoint = _env_bool("SAVE_CHECKPOINT", args.save_checkpoint) 
+args.load_checkpoint = _env_str("LOAD_CHECKPOINT", args.load_checkpoint)
 args.log_all_ranks = _env_bool("LOG_ALL_RANKS", args.log_all_ranks)       
 args.flexattn_dynamo_disable = _env_bool("FLEXATTN_DYNAMO_DISABLE", args.flexattn_dynamo_disable)
 args.flexattn_compile = _env_bool("FLEXATTN_COMPILE", args.flexattn_compile)
@@ -777,6 +820,10 @@ args.torch_compile_fullgraph = _env_bool("TORCH_COMPILE_FULLGRAPH", args.torch_c
 args.torch_dynamo_verbose = _env_bool("TORCHDYNAMO_VERBOSE", args.torch_dynamo_verbose)
 args.torch_dynamo_suppress_errors = _env_bool("TORCHDYNAMO_SUPPRESS_ERRORS", args.torch_dynamo_suppress_errors)
 args.torch_compile_fallback_to_eager = _env_bool("TORCH_COMPILE_FALLBACK_TO_EAGER", args.torch_compile_fallback_to_eager)
+
+# Derived defaults that should reflect env overrides.
+if os.environ.get("NEEDLE_SEQ_LEN") is None:
+    args.needle_seq_len = args.val_seq_len
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -884,6 +931,7 @@ print0(
                 dynamo_disable=bool(args.flexattn_dynamo_disable),
                 compile=bool(args.flexattn_compile),
             ),
+            checkpoint=dict(load=str(args.load_checkpoint) if str(args.load_checkpoint) else None),
             scope=dict(
                 enabled=bool(args.spectral_bias),
                 impl=str(args.spectral_impl),
@@ -901,6 +949,15 @@ print0(
                 pointer_global_blocks=int(args.spectral_pointer_global_blocks),
                 val_force=bool(args.spectral_pointer_val_force),
                 val_half_blocks=int(args.spectral_pointer_val_half_blocks),
+            ),
+            needle_eval=dict(
+                enabled=bool(args.needle_eval),
+                every=int(args.needle_eval_every),
+                seq_len=int(args.needle_seq_len),
+                distances=str(args.needle_distances),
+                samples_per_distance=int(args.needle_samples_per_distance),
+                anchor_len=int(args.needle_anchor_len),
+                value_len=int(args.needle_value_len),
             ),
         )
     ),
@@ -943,6 +1000,45 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
+
+def _strip_state_dict_prefix(state: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
+    if not prefix:
+        return state
+    if not any(k.startswith(prefix) for k in state.keys()):
+        return state
+    return { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items() }
+
+if str(args.load_checkpoint):
+    if master_process:
+        ckpt = torch.load(str(args.load_checkpoint), map_location="cpu")
+        state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+        if not isinstance(state, dict):
+            raise ValueError(f"LOAD_CHECKPOINT expected a state-dict-like object, got {type(state)}")
+        used_prefix = None
+        last_err = None
+        for prefix in ("", "_orig_mod.", "module."):
+            try:
+                to_load = state if prefix == "" else _strip_state_dict_prefix(state, prefix)
+                model.load_state_dict(to_load, strict=True)
+                used_prefix = prefix
+                break
+            except RuntimeError as e:
+                last_err = e
+        if used_prefix is None:
+            assert last_err is not None
+            raise last_err
+        print0(
+            json.dumps(
+                dict(
+                    tag="CHECKPOINT_LOADED",
+                    path=str(args.load_checkpoint),
+                    step=int(ckpt.get("step", -1)) if isinstance(ckpt, dict) else -1,
+                    used_prefix=str(used_prefix),
+                )
+            ),
+            console=True,
+        )
+    # Sync model weights across ranks (rank0 is source-of-truth).
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1067,6 +1163,147 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         ptr_center_blocks_hist=_to_frac_list(pc_hist, pc_total),
     )
     print0(json.dumps(payload), console=True)
+
+def _parse_csv_ints(s: str) -> list[int]:
+    parts = [p.strip() for p in str(s).split(",")]
+    out: list[int] = []
+    for p in parts:
+        if not p:
+            continue
+        out.append(int(p))
+    return out
+
+def maybe_run_needle_eval(*, step: int, window_blocks: Tensor, force: bool = False):
+    # Rank0-only synthetic NIAH eval (SPEC.md §8B). Uses the subset-logits path
+    # in `GPT.forward(..., logit_positions=...)` to avoid materializing [T,V].
+    if not args.needle_eval:
+        return
+    if not force:
+        every = int(args.needle_eval_every)
+        if every <= 0 or (step % every) != 0:
+            return
+
+    seq_len = int(args.needle_seq_len)
+    if seq_len % 128 != 0:
+        raise ValueError(f"NEEDLE_SEQ_LEN must be divisible by 128, got {seq_len}")
+    max_seq_len = int(max(args.train_seq_len, args.val_seq_len))
+    if seq_len > max_seq_len:
+        raise ValueError(f"NEEDLE_SEQ_LEN={seq_len} exceeds max_seq_len={max_seq_len} (set VAL_SEQ_LEN/TRAIN_SEQ_LEN higher)")
+
+    anchor_len = int(args.needle_anchor_len)
+    value_len = int(args.needle_value_len)
+    if anchor_len <= 0 or value_len <= 0:
+        raise ValueError("NEEDLE_ANCHOR_LEN and NEEDLE_VALUE_LEN must be > 0")
+
+    query_start = seq_len - (anchor_len + value_len)  # place query at end
+    min_dist = anchor_len + value_len + 1
+
+    distances = [d for d in _parse_csv_ints(args.needle_distances) if d >= min_dist and d <= query_start]
+    if not distances:
+        raise ValueError(
+            f"NEEDLE_DISTANCES produced no valid distances for seq_len={seq_len} (query_start={query_start}, min_dist={min_dist})"
+        )
+    samples = int(args.needle_samples_per_distance)
+    if samples <= 0:
+        raise ValueError("NEEDLE_SAMPLES_PER_DISTANCE must be > 0")
+
+    # Synchronize ranks so training doesn't proceed while rank0 runs eval.
+    dist.barrier()
+    if not master_process:
+        dist.barrier()
+        return
+
+    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+    vocab_high = int(args.vocab_size - 1)  # exclude EOD token id 50256 from random tokens
+
+    results: dict[int, dict[str, float]] = {}
+    total_loss = 0.0
+    total_acc = 0.0
+    total_em = 0.0
+    total_n = 0
+
+    model.eval()
+    with torch.no_grad():
+        for dist_tokens in distances:
+            dist_tokens = int(dist_tokens)
+            needle_start = query_start - dist_tokens
+            # Sanity: ensure the two segments don't overlap.
+            if needle_start < 0 or (needle_start + anchor_len + value_len) >= query_start:
+                continue
+
+            sum_loss = 0.0
+            sum_acc = 0.0
+            sum_em = 0.0
+            for si in range(samples):
+                gen = torch.Generator(device=device)
+                gen.manual_seed(int(args.seed) + 1000003 * int(step) + 1009 * dist_tokens + si)
+
+                full = torch.randint(0, vocab_high, (seq_len + 1,), device=device, dtype=torch.int32, generator=gen)
+                anchor = torch.randint(0, vocab_high, (anchor_len,), device=device, dtype=torch.int32, generator=gen)
+                value = torch.randint(0, vocab_high, (value_len,), device=device, dtype=torch.int32, generator=gen)
+
+                full[needle_start : needle_start + anchor_len] = anchor
+                full[needle_start + anchor_len : needle_start + anchor_len + value_len] = value
+                full[query_start : query_start + anchor_len] = anchor
+                full[query_start + anchor_len : query_start + anchor_len + value_len] = value
+
+                input_seq = full[:-1]
+                targets = full[1:].to(torch.int64)
+                logit_pos0 = query_start + anchor_len - 1
+                logit_positions = torch.arange(logit_pos0, logit_pos0 + value_len, device=device, dtype=torch.long)
+
+                def _needle_fwd():
+                    return model(
+                        input_seq,
+                        targets,
+                        window_blocks,
+                        logit_positions=logit_positions,
+                        return_metrics=True,
+                    )
+
+                loss_t, acc_t, em_t = run_with_compile_fallback(_needle_fwd, where=f"needle_eval_step{step}")
+                sum_loss += float(loss_t.item())
+                sum_acc += float(acc_t.item())
+                sum_em += float(em_t.item())
+
+            denom = float(max(samples, 1))
+            results[dist_tokens] = dict(
+                dist_blocks=int(dist_tokens // 128),
+                loss=(sum_loss / denom),
+                ppl=float(math.exp(sum_loss / denom)),
+                token_acc=(sum_acc / denom),
+                exact_match=(sum_em / denom),
+            )
+            total_loss += sum_loss
+            total_acc += sum_acc
+            total_em += sum_em
+            total_n += samples
+
+    if total_n > 0:
+        overall = dict(
+            loss=float(total_loss / total_n),
+            ppl=float(math.exp(total_loss / total_n)),
+            token_acc=float(total_acc / total_n),
+            exact_match=float(total_em / total_n),
+        )
+    else:
+        overall = dict(loss=None, ppl=None, token_acc=None, exact_match=None)
+
+    payload = dict(
+        tag="NEEDLE_EVAL",
+        step=int(step),
+        seq_len=int(seq_len),
+        anchor_len=int(anchor_len),
+        value_len=int(value_len),
+        samples_per_distance=int(samples),
+        sliding_window_blocks=int(window_blocks.item()) if isinstance(window_blocks, Tensor) else None,
+        pointer_mask=dict(enabled=pointer_mask_state.get("enabled"), half_blocks=pointer_mask_state.get("half_blocks")),
+        results={str(k): v for k, v in results.items()},
+        overall=overall,
+    )
+    print0(json.dumps(payload), console=True)
+
+    dist.barrier()
 
 # collect the parameters to optimize
 spectral_params = [p for n, p in model.named_parameters() if "spectral_bias" in n]
@@ -1269,17 +1506,19 @@ for step in range(train_steps + 1):
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+        window_blocks = get_window_size_blocks(step)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
                 def _val_fwd():
-                    return model(inputs, targets, get_window_size_blocks(step))
+                    return model(inputs, targets, window_blocks)
                 val_loss += run_with_compile_fallback(_val_fwd, where=f"val_fwd_step{step}")
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        maybe_run_needle_eval(step=step, window_blocks=window_blocks, force=last_step)
         model.train()
         if val_pointer_forced:
             maybe_update_pointer_mask(step)

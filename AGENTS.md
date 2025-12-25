@@ -62,6 +62,7 @@ unless forced:
 - `SCOPE_BINS`: bin edges at startup.
 - `SCOPE_STATS`: every `SCOPE_LOG_EVERY` steps (KV unique-block stats, pointer behavior proxies,
   `pi` entropy, and regularizer magnitudes).
+- `NEEDLE_EVAL`: optional synthetic NIAH retrieval eval (by distance), gated by `NEEDLE_EVAL=1`.
 
 ## Current Blocker / Debug Context
 

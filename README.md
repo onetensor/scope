@@ -31,7 +31,7 @@ This code expects pre-tokenized `.bin` shards (same format as `data/cached_finew
 
 ### Single run
 
-From `modded-nanogpt/`:
+From the repo root:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 scoped_medium.py
@@ -60,6 +60,23 @@ Controls:
 
 - `NUM_ITERATIONS`, `VAL_TOKENS`, `VAL_LOSS_EVERY`, `SEED`
 - `SCOPE_LOG_EVERY=200` (rank0-only SCOPE stats cadence)
+
+## Needle-in-a-Haystack Eval (synthetic)
+
+Emits a rank0 JSON blob with `tag="NEEDLE_EVAL"` (loss/ppl/token-acc/EM by distance):
+
+- `NEEDLE_EVAL=1`
+- `NEEDLE_SEQ_LEN=65536`
+- `NEEDLE_DISTANCES=4096,8192,16384,32768`
+- `NEEDLE_SAMPLES_PER_DISTANCE=8`
+- `NEEDLE_ANCHOR_LEN=4`
+- `NEEDLE_VALUE_LEN=8`
+
+Evaluate a saved checkpoint without training:
+
+```bash
+LOAD_CHECKPOINT=/path/to/state_step001000.pt NUM_ITERATIONS=0 VAL_LOSS_EVERY=0 NEEDLE_EVAL=1 torchrun --standalone --nproc_per_node=8 scoped_medium.py
+```
 
 ## SCOPE Controls (env vars)
 
