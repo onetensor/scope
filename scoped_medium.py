@@ -366,9 +366,10 @@ class CausalSelfAttention(nn.Module):
             K = int(self.spectral_bias.K)
 
             if self.spectral_bias.use_pointer_mask:
-                block_mask = self.spectral_bias.build_pointer_blockmask(
+                block_mask = self.spectral_bias.build_pointer_blockmask(        
                     docs=docs,
                     delta_star=delta_star,
+                    pi=_pi,
                     block_size=128,
                 )
 
@@ -713,6 +714,8 @@ class Hyperparameters:
     spectral_use_pointer_mask = True
     spectral_pointer_local_blocks = 12
     spectral_pointer_half_blocks = 4
+    spectral_pointer_budget_blocks = 8  # total extra pointer KV blocks across peaks (per head/qblock)
+    spectral_pointer_radius_mode = "pi"  # "fixed" | "pi"
     # Global anchors are a training stability aid but can cause "block0 collapse" if left on.
     # Default: warmup with 2 blocks, then drop to 0 so pointers must learn nontrivial retrieval.
     spectral_pointer_global_blocks = 0
@@ -723,9 +726,14 @@ class Hyperparameters:
     spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2
-    # Validation override for pointer mask (default: use scheduled state).
+    # Validation override for pointer mask (default: use scheduled state).      
     spectral_pointer_val_force = False
     spectral_pointer_val_half_blocks = -1  # <0 -> use spectral_pointer_half_blocks
+    spectral_pi_entropy_floor_frac = 0.25  # only penalize entropy below this (fraction of log(M))
+    spectral_lambda_delta_edge = 1e-4
+    spectral_delta_edge_eps = 0.05
+    spectral_delta_edge_schedule_start_step = 0
+    spectral_delta_edge_schedule_steps = 1000
     spectral_lambda_omega = 1e-5
     spectral_lambda_zero_mean = 1e-4
     spectral_lambda_entropy = 1e-4
@@ -824,9 +832,16 @@ args.spectral_pointer_val_force = _env_bool("SPECTRAL_POINTER_VAL_FORCE", args.s
 args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOCKS", args.spectral_pointer_val_half_blocks)
 args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
 args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
+args.spectral_pointer_budget_blocks = _env_int("SPECTRAL_POINTER_BUDGET_BLOCKS", args.spectral_pointer_budget_blocks)
+args.spectral_pointer_radius_mode = _env_str("SPECTRAL_POINTER_RADIUS_MODE", args.spectral_pointer_radius_mode).strip().lower()
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
 args.spectral_pointer_global_blocks_warmup = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP", args.spectral_pointer_global_blocks_warmup)
 args.spectral_pointer_global_blocks_warmup_steps = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS", args.spectral_pointer_global_blocks_warmup_steps)
+args.spectral_pi_entropy_floor_frac = _env_float("SPECTRAL_PI_ENTROPY_FLOOR_FRAC", args.spectral_pi_entropy_floor_frac)
+args.spectral_lambda_delta_edge = _env_float("SPECTRAL_LAMBDA_DELTA_EDGE", args.spectral_lambda_delta_edge)
+args.spectral_delta_edge_eps = _env_float("SPECTRAL_DELTA_EDGE_EPS", args.spectral_delta_edge_eps)
+args.spectral_delta_edge_schedule_start_step = _env_int("SPECTRAL_DELTA_EDGE_SCHEDULE_START_STEP", args.spectral_delta_edge_schedule_start_step)
+args.spectral_delta_edge_schedule_steps = _env_int("SPECTRAL_DELTA_EDGE_SCHEDULE_STEPS", args.spectral_delta_edge_schedule_steps)
 args.spectral_delta_star_max_schedule = _env_bool("SPECTRAL_DELTA_STAR_MAX_SCHEDULE", args.spectral_delta_star_max_schedule)
 args.spectral_delta_star_max_schedule_start_step = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP", args.spectral_delta_star_max_schedule_start_step)
 args.spectral_delta_star_max_schedule_steps = _env_int("SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS", args.spectral_delta_star_max_schedule_steps)
@@ -981,11 +996,18 @@ print0(
                 pointer_schedule=bool(args.spectral_pointer_schedule),
                 pointer_local_blocks=int(args.spectral_pointer_local_blocks),
                 pointer_half_blocks=int(args.spectral_pointer_half_blocks),
+                pointer_budget_blocks=int(args.spectral_pointer_budget_blocks),
+                pointer_radius_mode=str(args.spectral_pointer_radius_mode),
                 pointer_global_blocks=int(args.spectral_pointer_global_blocks),
                 pointer_global_blocks_warmup=int(args.spectral_pointer_global_blocks_warmup),
                 pointer_global_blocks_warmup_steps=int(args.spectral_pointer_global_blocks_warmup_steps),
                 val_force=bool(args.spectral_pointer_val_force),
                 val_half_blocks=int(args.spectral_pointer_val_half_blocks),
+                pi_entropy_floor_frac=float(args.spectral_pi_entropy_floor_frac),
+                lambda_delta_edge=float(args.spectral_lambda_delta_edge),
+                delta_edge_eps=float(args.spectral_delta_edge_eps),
+                delta_edge_schedule_start_step=int(args.spectral_delta_edge_schedule_start_step),
+                delta_edge_schedule_steps=int(args.spectral_delta_edge_schedule_steps),
             ),
             needle_eval=dict(
                 enabled=bool(args.needle_eval),
@@ -1027,11 +1049,16 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
                            use_pointer_mask=args.spectral_use_pointer_mask,
                            pointer_local_blocks=args.spectral_pointer_local_blocks,
                            pointer_half_blocks=args.spectral_pointer_half_blocks,
+                           pointer_budget_blocks=args.spectral_pointer_budget_blocks,
+                           pointer_radius_mode=args.spectral_pointer_radius_mode,
                             pointer_global_blocks=max(
                                 int(args.spectral_pointer_global_blocks),
                                 int(args.spectral_pointer_global_blocks_warmup),
                             ),
                            pointer_qblock_rep=args.spectral_pointer_qblock_rep,
+                           pi_entropy_floor_frac=args.spectral_pi_entropy_floor_frac,
+                           lambda_delta_edge=args.spectral_lambda_delta_edge,
+                           delta_edge_eps=args.spectral_delta_edge_eps,
                            lambda_omega=args.spectral_lambda_omega,
                            lambda_zero_mean=args.spectral_lambda_zero_mean,
                            lambda_entropy=args.spectral_lambda_entropy,
@@ -1177,6 +1204,30 @@ def maybe_update_delta_star_max(step: int):
         sb.set_delta_star_max_active(max_tokens=desired)
     delta_star_max_state["max_tokens"] = desired
 
+delta_edge_state = dict(eps=None)
+def maybe_update_delta_edge_eps(step: int):
+    if not spectral_bias_modules or not args.spectral_bias:
+        return
+    if float(args.spectral_lambda_delta_edge) <= 0.0 or float(args.spectral_delta_edge_eps) <= 0.0:
+        desired = 0.0
+    else:
+        base = float(args.spectral_delta_edge_eps)
+        start = int(args.spectral_delta_edge_schedule_start_step)
+        steps = int(args.spectral_delta_edge_schedule_steps)
+        if step < start:
+            desired = base
+        elif steps <= 0:
+            desired = 0.0
+        else:
+            t = (step - start) / float(steps)
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            desired = base * (1.0 - t)
+    if delta_edge_state["eps"] == desired:
+        return
+    for sb in spectral_bias_modules:
+        sb.set_delta_edge_eps_active(eps=desired)
+    delta_edge_state["eps"] = desired
+
 def _hist_percentile(hist: Tensor, q: float) -> int | None:
     total = int(hist.sum().item())
     if total <= 0:
@@ -1212,10 +1263,12 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
     dt_hist = sum((sb._dbg_delta_tokens_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_tokens_hist))
     db_hist = sum((sb._dbg_delta_blocks_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_blocks_hist))
     pc_hist = sum((sb._dbg_ptr_center_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_center_hist))
+    pr_hist = sum((sb._dbg_ptr_radius_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_radius_hist))
 
     dt_total = int(dt_hist.sum().item())
     db_total = int(db_hist.sum().item())
     pc_total = int(pc_hist.sum().item())
+    pr_total = int(pr_hist.sum().item())
 
     def _to_frac_list(hist: Tensor, total: int) -> list[float]:
         if total <= 0:
@@ -1230,6 +1283,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
 
     reg_omega = float(torch.stack([sb._dbg_reg_omega for sb in sbs]).sum().item())
     reg_entropy = float(torch.stack([sb._dbg_reg_entropy for sb in sbs]).sum().item())
+    reg_delta_edge = float(torch.stack([sb._dbg_reg_delta_edge for sb in sbs]).sum().item())
     reg_zero_mean = float(torch.stack([sb._dbg_reg_zero_mean for sb in sbs]).sum().item())
     reg_total = float(torch.stack([sb._dbg_reg_total for sb in sbs]).sum().item())
 
@@ -1246,6 +1300,8 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         pointer_cfg=dict(
             local_blocks=int(sb0.pointer_local_blocks),
             half_blocks_max=int(sb0.pointer_half_blocks),
+            budget_blocks=int(sb0.pointer_budget_blocks),
+            radius_mode=str(sb0.pointer_radius_mode),
             global_blocks_max=int(sb0.pointer_global_blocks),
             qblock_rep=str(sb0.pointer_qblock_rep),
         ),
@@ -1264,10 +1320,11 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             max=float(docstart_fracs.max().item()),
         ),
         pi_entropy_mean=dict(mean=float(pi_entropies.mean().item()), min=float(pi_entropies.min().item()), max=float(pi_entropies.max().item())),
-        reg=dict(omega=reg_omega, entropy=reg_entropy, zero_mean=reg_zero_mean, total=reg_total),
+        reg=dict(omega=reg_omega, entropy=reg_entropy, delta_edge=reg_delta_edge, zero_mean=reg_zero_mean, total=reg_total),
         delta_tokens_hist=_to_frac_list(dt_hist, dt_total),
         delta_blocks_hist=_to_frac_list(db_hist, db_total),
         ptr_center_blocks_hist=_to_frac_list(pc_hist, pc_total),
+        ptr_radius_hist=_to_frac_list(pr_hist, pr_total),
     )
     print0(json.dumps(payload), console=True)
 
@@ -1464,6 +1521,7 @@ def get_window_size_blocks(step: int):
 
 maybe_update_pointer_mask(0)
 maybe_update_delta_star_max(0)
+maybe_update_delta_edge_eps(0)
 compile_enabled = bool(args.torch_compile)
 if compile_enabled:
     try:
@@ -1598,6 +1656,7 @@ train_steps = args.num_iterations
 for step in range(train_steps + 1):
     maybe_update_pointer_mask(step)
     maybe_update_delta_star_max(step)
+    maybe_update_delta_edge_eps(step)
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------

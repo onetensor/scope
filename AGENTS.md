@@ -40,6 +40,8 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_POINTER_SCHEDULE=0|1`
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
+- `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this extra block budget across peaks)
+- `SPECTRAL_POINTER_RADIUS_MODE=fixed|pi`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=<int>`
@@ -48,6 +50,11 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_MAX=<int>` (`-1` -> `max(TRAIN_SEQ_LEN,VAL_SEQ_LEN)-1` default)
 - `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_START_STEP=<int>`
 - `SPECTRAL_DELTA_STAR_MAX_SCHEDULE_STEPS=<int>`
+- `SPECTRAL_PI_ENTROPY_FLOOR_FRAC=<float>` (only penalize entropy below this fraction of `log(M)`)
+- `SPECTRAL_LAMBDA_DELTA_EDGE=<float>` (Δ* edge-avoidance reg strength)
+- `SPECTRAL_DELTA_EDGE_EPS=<float>` (normalized edge band, e.g. `0.05`)
+- `SPECTRAL_DELTA_EDGE_SCHEDULE_START_STEP=<int>`
+- `SPECTRAL_DELTA_EDGE_SCHEDULE_STEPS=<int>`
 
 ## Checkpointing
 

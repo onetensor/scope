@@ -40,9 +40,21 @@ class SpectralBiasConfig:
     pointer_local_blocks: int = 16
     pointer_half_blocks: int = 4
     pointer_global_blocks: int = 0
+    # Total extra KV blocks allocated across peaks, per (head, q_block). This is
+    # used only when `use_pointer_mask=True` and `pointer_budget_blocks > 0`.
+    pointer_budget_blocks: int = 0
+    # "fixed" -> each peak gets the same scheduled radius (`half_blocks_active`)
+    # "pi" -> per-peak radii derived from π + `pointer_budget_blocks`
+    pointer_radius_mode: str = "pi"
     pointer_qblock_rep: str = "last"  # "last"|"mean"
     # debug/telemetry (rank0 recommended)
     debug_stats: bool = False
+    # π entropy regularization: only penalize collapse below this floor
+    # (fraction of log(M)), instead of pushing toward uniform.
+    pi_entropy_floor_frac: float = 0.25
+    # Δ* anti-saturation: penalize predictions near 0 / cap (optional).
+    lambda_delta_edge: float = 0.0
+    delta_edge_eps: float = 0.0
 
 
 class SpectralBias(nn.Module):
@@ -80,10 +92,15 @@ class SpectralBias(nn.Module):
         pointer_local_blocks: int = 16,
         pointer_half_blocks: int = 4,
         pointer_global_blocks: int = 0,
+        pointer_budget_blocks: int = 0,
+        pointer_radius_mode: str = "pi",
         pointer_qblock_rep: str = "last",
         lambda_omega: float = 1e-5,
         lambda_zero_mean: float = 1e-4,
         lambda_entropy: float = 1e-4,
+        pi_entropy_floor_frac: float = 0.25,
+        lambda_delta_edge: float = 0.0,
+        delta_edge_eps: float = 0.0,
         debug_stats: bool = False,
         enabled: bool = True,
     ):
@@ -119,6 +136,10 @@ class SpectralBias(nn.Module):
         self.pointer_local_blocks = int(pointer_local_blocks)
         self.pointer_half_blocks = int(pointer_half_blocks)
         self.pointer_global_blocks = int(pointer_global_blocks)
+        self.pointer_budget_blocks = int(pointer_budget_blocks)
+        self.pointer_radius_mode = str(pointer_radius_mode).strip().lower()
+        if self.pointer_radius_mode not in {"fixed", "pi"}:
+            raise ValueError("pointer_radius_mode must be one of: fixed|pi")
         self.pointer_qblock_rep = str(pointer_qblock_rep)
         if self.pointer_qblock_rep not in {"last", "mean"}:
             raise ValueError("pointer_qblock_rep must be one of: last|mean")
@@ -148,6 +169,14 @@ class SpectralBias(nn.Module):
         self.lambda_omega = float(lambda_omega)
         self.lambda_zero_mean = float(lambda_zero_mean)
         self.lambda_entropy = float(lambda_entropy)
+        self.pi_entropy_floor_frac = float(pi_entropy_floor_frac)
+        self.lambda_delta_edge = float(lambda_delta_edge)
+        self.delta_edge_eps = float(delta_edge_eps)
+        self.register_buffer(
+            "_delta_edge_eps_active",
+            torch.tensor(self.delta_edge_eps, dtype=torch.float32),
+            persistent=False,
+        )
 
         w_min = float(w_min) if w_min is not None else (2 * math.pi / L_max)
         w_max = float(w_max) if w_max is not None else (2 * math.pi / L_train)
@@ -185,9 +214,11 @@ class SpectralBias(nn.Module):
         self.register_buffer("_dbg_ptr_block0_frac", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_ptr_block0_frac_excl", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_ptr_docstart_frac", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_ptr_radius_hist", torch.zeros(self.pointer_half_blocks + 1, dtype=torch.int32), persistent=False)
         self.register_buffer("_dbg_pi_entropy_mean", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_reg_omega", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_reg_entropy", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_dbg_reg_delta_edge", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_reg_zero_mean", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_dbg_reg_total", torch.zeros((), dtype=torch.float32), persistent=False)
 
@@ -286,6 +317,12 @@ class SpectralBias(nn.Module):
             raise ValueError("max_tokens must be >= 0")
         max_tokens = min(max_tokens, int(self.delta_star_max))
         self._delta_star_max_active.fill_(max_tokens)
+
+    def set_delta_edge_eps_active(self, *, eps: float):
+        eps = float(eps)
+        if eps < 0:
+            raise ValueError("eps must be >= 0")
+        self._delta_edge_eps_active.fill_(eps)
 
     def forward(
         self,
@@ -388,6 +425,7 @@ class SpectralBias(nn.Module):
         # Regularizers (only during training).
         reg_omega = q.new_zeros((), dtype=torch.float32)
         reg_entropy = q.new_zeros((), dtype=torch.float32)
+        reg_delta_edge = q.new_zeros((), dtype=torch.float32)
         reg_zero_mean = q.new_zeros((), dtype=torch.float32)
         if self.training:
             if self.lambda_omega > 0:
@@ -395,7 +433,9 @@ class SpectralBias(nn.Module):
                 reg_omega = self.lambda_omega * (omega_sq * a_mk.square()).sum(dim=-1).mean()
             if self.lambda_entropy > 0:
                 entropy = -(pi * (pi + self.eps).log()).sum(dim=-1)  # [B,H,L]
-                reg_entropy = self.lambda_entropy * (math.log(M) - entropy).mean()
+                h_floor = float(self.pi_entropy_floor_frac) * math.log(M)
+                if h_floor > 0:
+                    reg_entropy = self.lambda_entropy * F.relu(entropy.new_tensor(h_floor) - entropy).mean()
             if self.lambda_zero_mean > 0:
                 # mean_Δ b(Δ) using trig means (ignoring optional gate for now)
                 cos_mean = cos_mean.to(device=device)  # [K]
@@ -403,8 +443,14 @@ class SpectralBias(nn.Module):
                 mean_delta = 0.5 * float(L - 1)
                 mean_b = (coeff_cos * cos_mean).sum(dim=-1) + (coeff_sin * sin_mean).sum(dim=-1) + slope * mean_delta - b0
                 reg_zero_mean = self.lambda_zero_mean * mean_b.mean().square()
+            if self.lambda_delta_edge > 0:
+                edge_eps = self._delta_edge_eps_active.to(device=device, dtype=torch.float32)
+                denom = torch.clamp(delta_cap, min=1.0)
+                u = (delta_star / denom).clamp(min=0.0, max=1.0)
+                edge = F.relu(edge_eps - u) + F.relu(u - (1.0 - edge_eps))
+                reg_delta_edge = self.lambda_delta_edge * edge.mean()
 
-        reg_loss = reg_omega + reg_entropy + reg_zero_mean
+        reg_loss = reg_omega + reg_entropy + reg_delta_edge + reg_zero_mean
 
         if self.debug_stats:
             # Representative pointer stats per query-block.
@@ -472,6 +518,7 @@ class SpectralBias(nn.Module):
 
             self._dbg_reg_omega.copy_(reg_omega.detach())
             self._dbg_reg_entropy.copy_(reg_entropy.detach())
+            self._dbg_reg_delta_edge.copy_(reg_delta_edge.detach())
             self._dbg_reg_zero_mean.copy_(reg_zero_mean.detach())
             self._dbg_reg_total.copy_(reg_loss.detach())
 
@@ -496,9 +543,11 @@ class SpectralBias(nn.Module):
         input_seq: Tensor | None = None,
         docs: Tensor | None = None,
         delta_star: Tensor,
+        pi: Tensor,
         block_size: int = 128,
         local_blocks: int | None = None,
         ptr_half_blocks: int | None = None,
+        pointer_budget_blocks: int | None = None,
         global_blocks: int | None = None,
         eod_token_id: int = 50256,
     ) -> BlockMask:
@@ -525,6 +574,7 @@ class SpectralBias(nn.Module):
         assert TT == T
         assert H == self.num_heads
         assert M == self.M
+        assert pi.shape == (B, H, T, M)
 
         local_blocks = self.pointer_local_blocks if local_blocks is None else int(local_blocks)
         ptr_half_blocks = self.pointer_half_blocks if ptr_half_blocks is None else int(ptr_half_blocks)
@@ -557,8 +607,26 @@ class SpectralBias(nn.Module):
         # Representative Δ* per query block.
         if self.pointer_qblock_rep == "last":
             delta_rep = delta_star[0, :, t_rep_l]  # [H,QB,M]
+            pi_rep = pi[0, :, t_rep_l]  # [H,QB,M]
         else:
             delta_rep = delta_star[0].reshape(H, num_blocks, block_size, M).mean(dim=2)  # [H,QB,M]
+            pi_rep = pi[0].reshape(H, num_blocks, block_size, M).mean(dim=2)  # [H,QB,M]
+
+        if self.pointer_radius_mode == "fixed":
+            r_m = ptr_half_active.view(1, 1, 1).expand(H, num_blocks, M)  # [H,QB,M]
+            r_m = torch.where(ptr_enabled.bool(), r_m, torch.zeros_like(r_m))
+        else:
+            budget = self.pointer_budget_blocks if pointer_budget_blocks is None else int(pointer_budget_blocks)
+            budget = max(0, budget)
+            budget = min(budget, 2 * M * int(ptr_half_blocks))  # max extra blocks possible
+            if budget <= 0:
+                r_m = delta_rep.new_zeros(delta_rep.shape, dtype=torch.int32)  # [H,QB,M]
+            else:
+                alloc = torch.round(pi_rep * float(budget)).to(torch.int32)  # [H,QB,M]
+                r_m = torch.floor_divide(alloc, 2)  # each radius contributes 2*r extra blocks
+                r_m = torch.clamp(r_m, min=0, max=int(ptr_half_blocks))
+            r_m = torch.minimum(r_m, ptr_half_active)  # respect schedule cap
+            r_m = torch.where(ptr_enabled.bool(), r_m, torch.zeros_like(r_m))
 
         key_tok = t_rep[None, :, None].to(delta_rep.dtype) - delta_rep
         key_tok = key_tok.clamp(min=0.0)
@@ -579,12 +647,13 @@ class SpectralBias(nn.Module):
         # (2) pointer windows around each Δ*_m: [center-p ... center+p]
         if ptr_half_blocks > 0:
             offs_ptr = torch.arange(-ptr_half_blocks, ptr_half_blocks + 1, device=device, dtype=torch.int32)
-            active = offs_ptr.abs() <= ptr_half_active
+            offs_abs = offs_ptr.abs()
+            active = offs_abs[None, None, None, :] <= r_m[:, :, :, None]  # [H,QB,M,2p+1]
             ptr = ptr_center_blk[:, :, :, None] + offs_ptr[None, None, None, :]
             ptr = ptr.clamp(min=0, max=num_blocks - 1)
             ptr = torch.minimum(ptr, q_blocks[None, :, None, None])
             ptr = torch.maximum(ptr, doc_start_blk[None, :, None, None])
-            ptr = torch.where(active[None, None, None, :], ptr, ptr_center_blk[:, :, :, None])
+            ptr = torch.where(active, ptr, ptr_center_blk[:, :, :, None])
             pieces.append(ptr.flatten(2, 3))  # [H,QB,M*(2p+1)]
         else:
             pieces.append(ptr_center_blk)  # [H,QB,M]
@@ -622,6 +691,8 @@ class SpectralBias(nn.Module):
         if self.debug_stats:
             kv_hist = torch.bincount(kv_num_blocks.flatten().to(torch.int64), minlength=self._dbg_kv_unique_hist.numel())
             self._dbg_kv_unique_hist.copy_(kv_hist.to(torch.int32))
+            pr_hist = torch.bincount(r_m.flatten().to(torch.int64), minlength=self._dbg_ptr_radius_hist.numel())
+            self._dbg_ptr_radius_hist.copy_(pr_hist.to(torch.int32))
 
         # IMPORTANT: `BlockMask.from_kv_blocks` infers `kv_len` from the last dimension of
         # `kv_indices` times `BLOCK_SIZE`. We pass full-length K/V tensors into FlexAttention,
