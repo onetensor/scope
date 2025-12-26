@@ -18,7 +18,7 @@ Core ideas:
 
 ## Source Of Truth / Do-Not-Edit
 
-- `SPEC.md`: full project specification.
+- `SPEC.md`: most recent patch/change project specification.
 - `baseline.py`: frozen snapshot for ablations (do not modify).
 
 ## Repo Map (key files)
@@ -40,9 +40,31 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_POINTER_SCHEDULE=0|1`
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
-- `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this extra block budget across peaks)
+- `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this total pointer KV budget: local + centers + extra)
+- `SPECTRAL_POINTER_BUDGET_IS_TOTAL=0|1` (compatibility switch; `0` treats budget as extra-only)
+- `SPECTRAL_POINTER_BUDGET_TEMP=<float>` (temperature for budget stick-breaking)
 - `SPECTRAL_POINTER_RADIUS_MODE=fixed|pi`
 - `SPECTRAL_POINTER_DOC_CLAMP=0|1` (clamp local/pointer windows to the current doc start blocks)
+- `SPECTRAL_GUMBEL_TOPK=0|1`
+- `SPECTRAL_GUMBEL_TOPK_K=<int>` (0 -> use M)
+- `SPECTRAL_GUMBEL_TOPK_TAU=<float>`
+- `SPECTRAL_GUMBEL_TOPK_SEED=<int>` (0 -> use `SEED`)
+- `SPECTRAL_POINTER_RESET_LEN=<int>` (tokens; 0 disables)
+- `SPECTRAL_POINTER_RESET_P=<float>`
+- `SPECTRAL_POINTER_RESET_DECAY_STEPS=<int>`
+- `SPECTRAL_TEACHER=0|1`
+- `SPECTRAL_TEACHER_EVERY=<int>`
+- `SPECTRAL_TEACHER_LEN=<int>` (tokens; must be divisible by 128)
+- `SPECTRAL_TEACHER_LAYER=<int>` (0-based layer index)
+- `SPECTRAL_TEACHER_HEADS=<int>` (0 -> all heads)
+- `SPECTRAL_TEACHER_TEMP=<float>` (student include probability temperature)
+- `SPECTRAL_TEACHER_LAMBDA_COV=<float>`
+- `SPECTRAL_TEACHER_LAMBDA_BUDGET=<float>`
+- `SPECTRAL_TEACHER_DETACH_BACKBONE=0|1`
+- `SPECTRAL_TEACHER_NCE=0|1`
+- `SPECTRAL_TEACHER_NCE_POS=<int>`
+- `SPECTRAL_TEACHER_NCE_NEG=<int>`
+- `SPECTRAL_TEACHER_LAMBDA_NCE=<float>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=<int>`

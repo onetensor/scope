@@ -8,6 +8,7 @@ import copy
 import json
 import math
 import random
+import contextlib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -351,6 +352,7 @@ class CausalSelfAttention(nn.Module):
                 b0,
                 delta_star,
                 _pi,
+                budget_logits,
                 delta_main,
                 width,
                 cos_wD,
@@ -366,10 +368,11 @@ class CausalSelfAttention(nn.Module):
             K = int(self.spectral_bias.K)
 
             if self.spectral_bias.use_pointer_mask:
-                block_mask = self.spectral_bias.build_pointer_blockmask(        
+                block_mask = self.spectral_bias.build_pointer_blockmask(
                     docs=docs,
                     delta_star=delta_star,
                     pi=_pi,
+                    budget_logits=budget_logits,
                     block_size=128,
                 )
 
@@ -714,7 +717,9 @@ class Hyperparameters:
     spectral_use_pointer_mask = True
     spectral_pointer_local_blocks = 12
     spectral_pointer_half_blocks = 4
-    spectral_pointer_budget_blocks = 8  # total extra pointer KV blocks across peaks (per head/qblock)
+    spectral_pointer_budget_blocks = 8  # total pointer KV budget (local + centers + extra) per head/qblock
+    spectral_pointer_budget_is_total = True
+    spectral_pointer_budget_temp = 1.0
     spectral_pointer_radius_mode = "pi"  # "fixed" | "pi"
     # Global anchors are a training stability aid but can cause "block0 collapse" if left on.
     # Default: warmup with 2 blocks, then drop to 0 so pointers must learn nontrivial retrieval.
@@ -723,6 +728,26 @@ class Hyperparameters:
     spectral_pointer_global_blocks_warmup_steps = 300
     spectral_pointer_qblock_rep = "last"  # "last"|"mean"
     spectral_pointer_doc_clamp = True  # clamp local/pointer windows to doc start blocks
+    spectral_gumbel_topk = False
+    spectral_gumbel_topk_k = 0  # 0 -> use M (no masking)
+    spectral_gumbel_topk_tau = 1.0
+    spectral_gumbel_topk_seed = 0
+    spectral_pointer_reset_len = 0  # tokens; 0 disables
+    spectral_pointer_reset_p = 0.0
+    spectral_pointer_reset_decay_steps = 0
+    spectral_teacher = False
+    spectral_teacher_every = 50
+    spectral_teacher_len = 4096
+    spectral_teacher_layer = 6  # 0-based; mid-layer default for 16-layer stack
+    spectral_teacher_heads = 0  # 0 -> all heads
+    spectral_teacher_temp = 1.0
+    spectral_teacher_lambda_cov = 0.1
+    spectral_teacher_lambda_budget = 0.01
+    spectral_teacher_detach_backbone = True
+    spectral_teacher_nce = False
+    spectral_teacher_nce_pos = 4
+    spectral_teacher_nce_neg = 16
+    spectral_teacher_lambda_nce = 0.1
     spectral_pointer_schedule = True
     spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
@@ -834,11 +859,33 @@ args.spectral_pointer_val_half_blocks = _env_int("SPECTRAL_POINTER_VAL_HALF_BLOC
 args.spectral_pointer_local_blocks = _env_int("SPECTRAL_POINTER_LOCAL_BLOCKS", args.spectral_pointer_local_blocks)
 args.spectral_pointer_half_blocks = _env_int("SPECTRAL_POINTER_HALF_BLOCKS", args.spectral_pointer_half_blocks)
 args.spectral_pointer_budget_blocks = _env_int("SPECTRAL_POINTER_BUDGET_BLOCKS", args.spectral_pointer_budget_blocks)
+args.spectral_pointer_budget_is_total = _env_bool("SPECTRAL_POINTER_BUDGET_IS_TOTAL", args.spectral_pointer_budget_is_total)
+args.spectral_pointer_budget_temp = _env_float("SPECTRAL_POINTER_BUDGET_TEMP", args.spectral_pointer_budget_temp)
 args.spectral_pointer_radius_mode = _env_str("SPECTRAL_POINTER_RADIUS_MODE", args.spectral_pointer_radius_mode).strip().lower()
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
 args.spectral_pointer_global_blocks_warmup = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP", args.spectral_pointer_global_blocks_warmup)
 args.spectral_pointer_global_blocks_warmup_steps = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS", args.spectral_pointer_global_blocks_warmup_steps)
 args.spectral_pointer_doc_clamp = _env_bool("SPECTRAL_POINTER_DOC_CLAMP", args.spectral_pointer_doc_clamp)
+args.spectral_gumbel_topk = _env_bool("SPECTRAL_GUMBEL_TOPK", args.spectral_gumbel_topk)
+args.spectral_gumbel_topk_k = _env_int("SPECTRAL_GUMBEL_TOPK_K", args.spectral_gumbel_topk_k)
+args.spectral_gumbel_topk_tau = _env_float("SPECTRAL_GUMBEL_TOPK_TAU", args.spectral_gumbel_topk_tau)
+args.spectral_gumbel_topk_seed = _env_int("SPECTRAL_GUMBEL_TOPK_SEED", args.spectral_gumbel_topk_seed)
+args.spectral_pointer_reset_len = _env_int("SPECTRAL_POINTER_RESET_LEN", args.spectral_pointer_reset_len)
+args.spectral_pointer_reset_p = _env_float("SPECTRAL_POINTER_RESET_P", args.spectral_pointer_reset_p)
+args.spectral_pointer_reset_decay_steps = _env_int("SPECTRAL_POINTER_RESET_DECAY_STEPS", args.spectral_pointer_reset_decay_steps)
+args.spectral_teacher = _env_bool("SPECTRAL_TEACHER", args.spectral_teacher)
+args.spectral_teacher_every = _env_int("SPECTRAL_TEACHER_EVERY", args.spectral_teacher_every)
+args.spectral_teacher_len = _env_int("SPECTRAL_TEACHER_LEN", args.spectral_teacher_len)
+args.spectral_teacher_layer = _env_int("SPECTRAL_TEACHER_LAYER", args.spectral_teacher_layer)
+args.spectral_teacher_heads = _env_int("SPECTRAL_TEACHER_HEADS", args.spectral_teacher_heads)
+args.spectral_teacher_temp = _env_float("SPECTRAL_TEACHER_TEMP", args.spectral_teacher_temp)
+args.spectral_teacher_lambda_cov = _env_float("SPECTRAL_TEACHER_LAMBDA_COV", args.spectral_teacher_lambda_cov)
+args.spectral_teacher_lambda_budget = _env_float("SPECTRAL_TEACHER_LAMBDA_BUDGET", args.spectral_teacher_lambda_budget)
+args.spectral_teacher_detach_backbone = _env_bool("SPECTRAL_TEACHER_DETACH_BACKBONE", args.spectral_teacher_detach_backbone)
+args.spectral_teacher_nce = _env_bool("SPECTRAL_TEACHER_NCE", args.spectral_teacher_nce)
+args.spectral_teacher_nce_pos = _env_int("SPECTRAL_TEACHER_NCE_POS", args.spectral_teacher_nce_pos)
+args.spectral_teacher_nce_neg = _env_int("SPECTRAL_TEACHER_NCE_NEG", args.spectral_teacher_nce_neg)
+args.spectral_teacher_lambda_nce = _env_float("SPECTRAL_TEACHER_LAMBDA_NCE", args.spectral_teacher_lambda_nce)
 args.spectral_pi_entropy_floor_frac = _env_float("SPECTRAL_PI_ENTROPY_FLOOR_FRAC", args.spectral_pi_entropy_floor_frac)
 args.spectral_lambda_delta_edge = _env_float("SPECTRAL_LAMBDA_DELTA_EDGE", args.spectral_lambda_delta_edge)
 args.spectral_delta_edge_eps = _env_float("SPECTRAL_DELTA_EDGE_EPS", args.spectral_delta_edge_eps)
@@ -999,12 +1046,42 @@ print0(
                 pointer_local_blocks=int(args.spectral_pointer_local_blocks),
                 pointer_half_blocks=int(args.spectral_pointer_half_blocks),
                 pointer_budget_blocks=int(args.spectral_pointer_budget_blocks),
+                pointer_budget_is_total=bool(args.spectral_pointer_budget_is_total),
+                pointer_budget_temp=float(args.spectral_pointer_budget_temp),
                 pointer_radius_mode=str(args.spectral_pointer_radius_mode),
                 pointer_global_blocks=int(args.spectral_pointer_global_blocks),
                 pointer_global_blocks_warmup=int(args.spectral_pointer_global_blocks_warmup),
                 pointer_global_blocks_warmup_steps=int(args.spectral_pointer_global_blocks_warmup_steps),
                 pointer_qblock_rep=str(args.spectral_pointer_qblock_rep),
                 pointer_doc_clamp=bool(args.spectral_pointer_doc_clamp),
+                gumbel_topk=dict(
+                    enabled=bool(args.spectral_gumbel_topk),
+                    k=int(args.spectral_gumbel_topk_k),
+                    tau=float(args.spectral_gumbel_topk_tau),
+                    seed=int(args.spectral_gumbel_topk_seed),
+                ),
+                pointer_reset=dict(
+                    reset_len=int(args.spectral_pointer_reset_len),
+                    p=float(args.spectral_pointer_reset_p),
+                    decay_steps=int(args.spectral_pointer_reset_decay_steps),
+                ),
+                teacher=dict(
+                    enabled=bool(args.spectral_teacher),
+                    every=int(args.spectral_teacher_every),
+                    len_tokens=int(args.spectral_teacher_len),
+                    layer=int(args.spectral_teacher_layer),
+                    heads=int(args.spectral_teacher_heads),
+                    temp=float(args.spectral_teacher_temp),
+                    lambda_cov=float(args.spectral_teacher_lambda_cov),
+                    lambda_budget=float(args.spectral_teacher_lambda_budget),
+                    detach_backbone=bool(args.spectral_teacher_detach_backbone),
+                    nce=dict(
+                        enabled=bool(args.spectral_teacher_nce),
+                        pos=int(args.spectral_teacher_nce_pos),
+                        neg=int(args.spectral_teacher_nce_neg),
+                        lambda_nce=float(args.spectral_teacher_lambda_nce),
+                    ),
+                ),
                 val_force=bool(args.spectral_pointer_val_force),
                 val_half_blocks=int(args.spectral_pointer_val_half_blocks),
                 pi_entropy_floor_frac=float(args.spectral_pi_entropy_floor_frac),
@@ -1053,14 +1130,21 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
                            use_pointer_mask=args.spectral_use_pointer_mask,
                            pointer_local_blocks=args.spectral_pointer_local_blocks,
                            pointer_half_blocks=args.spectral_pointer_half_blocks,
-                           pointer_budget_blocks=args.spectral_pointer_budget_blocks,
-                           pointer_radius_mode=args.spectral_pointer_radius_mode,
-                            pointer_global_blocks=max(
-                                int(args.spectral_pointer_global_blocks),
-                                int(args.spectral_pointer_global_blocks_warmup),
-                            ),
+                            pointer_budget_blocks=args.spectral_pointer_budget_blocks,
+                            pointer_budget_is_total=args.spectral_pointer_budget_is_total,
+                            pointer_budget_temp=args.spectral_pointer_budget_temp,
+                            pointer_radius_mode=args.spectral_pointer_radius_mode,
+                             pointer_global_blocks=max(
+                                 int(args.spectral_pointer_global_blocks),
+                                 int(args.spectral_pointer_global_blocks_warmup),
+                             ),
                             pointer_qblock_rep=args.spectral_pointer_qblock_rep,
                             pointer_doc_clamp=args.spectral_pointer_doc_clamp,
+                            gumbel_topk=args.spectral_gumbel_topk,
+                            gumbel_topk_k=args.spectral_gumbel_topk_k,
+                            gumbel_topk_tau=args.spectral_gumbel_topk_tau,
+                            gumbel_topk_seed=args.spectral_gumbel_topk_seed,
+                            pointer_reset_len=args.spectral_pointer_reset_len,
                             pi_entropy_floor_frac=args.spectral_pi_entropy_floor_frac,
                             lambda_delta_edge=args.spectral_lambda_delta_edge,
                             delta_edge_eps=args.spectral_delta_edge_eps,
@@ -1130,6 +1214,7 @@ if master_process and spectral_bias_modules:
                 delta_blocks_edges=sb0._dbg_block_edges.tolist(),
                 ptr_center_blocks_edges=sb0._dbg_block_edges.tolist(),
                 kv_unique_blocks_max=int(sb0._dbg_kv_unique_hist.numel() - 1),
+                ptr_extra_sum_max=int(sb0._dbg_ptr_extra_sum_hist.numel() - 1),
             )
         ),
         console=True,
@@ -1176,6 +1261,49 @@ def maybe_update_pointer_mask(step: int):
     pointer_mask_state["enabled"] = enabled
     pointer_mask_state["half_blocks"] = half_blocks
     pointer_mask_state["global_blocks"] = global_blocks
+
+pointer_reset_state = dict(enabled=None, reset_len=None, p_active=None)
+def maybe_update_pointer_reset(step: int):
+    if not spectral_bias_modules:
+        return
+    reset_len = int(args.spectral_pointer_reset_len)
+    p0 = float(args.spectral_pointer_reset_p)
+    decay_steps = int(args.spectral_pointer_reset_decay_steps)
+    if reset_len <= 0 or p0 <= 0.0:
+        enabled = False
+        p_active = 0.0
+    else:
+        if decay_steps > 0:
+            t = min(max(step / float(decay_steps), 0.0), 1.0)
+            p_active = p0 * (1.0 - t)
+        else:
+            p_active = p0
+        rng = random.Random(int(args.seed) + 1000003 * int(step))
+        enabled = (p_active > 0.0) and (rng.random() < p_active)
+
+    if (
+        pointer_reset_state["enabled"] == enabled
+        and pointer_reset_state["reset_len"] == reset_len
+        and pointer_reset_state["p_active"] == p_active
+    ):
+        return
+    for sb in spectral_bias_modules:
+        sb.set_pointer_reset_state(enabled=enabled, reset_len=reset_len)
+    pointer_reset_state["enabled"] = enabled
+    pointer_reset_state["reset_len"] = reset_len
+    pointer_reset_state["p_active"] = p_active
+
+teacher_loss_state = dict(loss=None, cov=None, budget=None, nce=None, step=None)
+def maybe_update_gumbel_seed(step: int):
+    if not spectral_bias_modules:
+        return
+    if not args.spectral_gumbel_topk:
+        return
+    base = int(args.spectral_gumbel_topk_seed)
+    if base == 0:
+        base = int(args.seed)
+    for idx, sb in enumerate(spectral_bias_modules):
+        sb.set_gumbel_seed(seed=base + 10007 * int(step) + idx)
 
 delta_star_max_state = dict(max_tokens=None)
 def maybe_update_delta_star_max(step: int):
@@ -1269,11 +1397,13 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
     db_hist = sum((sb._dbg_delta_blocks_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_delta_blocks_hist))
     pc_hist = sum((sb._dbg_ptr_center_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_center_hist))
     pr_hist = sum((sb._dbg_ptr_radius_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_radius_hist))
+    pe_hist = sum((sb._dbg_ptr_extra_sum_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_ptr_extra_sum_hist))
 
     dt_total = int(dt_hist.sum().item())
     db_total = int(db_hist.sum().item())
     pc_total = int(pc_hist.sum().item())
     pr_total = int(pr_hist.sum().item())
+    pe_total = int(pe_hist.sum().item())
 
     def _to_frac_list(hist: Tensor, total: int) -> list[float]:
         if total <= 0:
@@ -1284,6 +1414,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
     block0_fracs = torch.stack([sb._dbg_ptr_block0_frac for sb in sbs]).float()
     block0_excl_fracs = torch.stack([sb._dbg_ptr_block0_frac_excl for sb in sbs]).float()
     docstart_fracs = torch.stack([sb._dbg_ptr_docstart_frac for sb in sbs]).float()
+    radius0_fracs = torch.stack([sb._dbg_ptr_radius0_frac for sb in sbs]).float()
     pi_entropies = torch.stack([sb._dbg_pi_entropy_mean for sb in sbs]).float()
 
     reg_omega = float(torch.stack([sb._dbg_reg_omega for sb in sbs]).sum().item())
@@ -1302,14 +1433,26 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             half_blocks=int(pointer_mask_state["half_blocks"]),
             global_blocks=int(pointer_mask_state["global_blocks"]),
         ),
+        pointer_reset=dict(
+            enabled=bool(pointer_reset_state.get("enabled")),
+            reset_len=int(pointer_reset_state.get("reset_len") or 0),
+            p_active=float(pointer_reset_state.get("p_active") or 0.0),
+        ),
         pointer_cfg=dict(
             local_blocks=int(sb0.pointer_local_blocks),
             half_blocks_max=int(sb0.pointer_half_blocks),
             budget_blocks=int(sb0.pointer_budget_blocks),
+            budget_is_total=bool(sb0.pointer_budget_is_total),
+            budget_temp=float(sb0.pointer_budget_temp),
             radius_mode=str(sb0.pointer_radius_mode),
             global_blocks_max=int(sb0.pointer_global_blocks),
             qblock_rep=str(sb0.pointer_qblock_rep),
             doc_clamp=bool(sb0.pointer_doc_clamp),
+            gumbel_topk=dict(
+                enabled=bool(sb0.gumbel_topk),
+                k=int(sb0.gumbel_topk_k),
+                tau=float(sb0.gumbel_topk_tau),
+            ),
         ),
         delta_star_max_active=(int(delta_star_max_state["max_tokens"]) if delta_star_max_state.get("max_tokens") is not None else None),
         kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, min=kv_min, max=kv_max),
@@ -1325,14 +1468,316 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             min=float(docstart_fracs.min().item()),
             max=float(docstart_fracs.max().item()),
         ),
+        ptr_radius0_frac=dict(
+            mean=float(radius0_fracs.mean().item()),
+            min=float(radius0_fracs.min().item()),
+            max=float(radius0_fracs.max().item()),
+        ),
         pi_entropy_mean=dict(mean=float(pi_entropies.mean().item()), min=float(pi_entropies.min().item()), max=float(pi_entropies.max().item())),
         reg=dict(omega=reg_omega, entropy=reg_entropy, delta_edge=reg_delta_edge, zero_mean=reg_zero_mean, total=reg_total),
         delta_tokens_hist=_to_frac_list(dt_hist, dt_total),
         delta_blocks_hist=_to_frac_list(db_hist, db_total),
         ptr_center_blocks_hist=_to_frac_list(pc_hist, pc_total),
         ptr_radius_hist=_to_frac_list(pr_hist, pr_total),
+        ptr_extra_sum_hist=_to_frac_list(pe_hist, pe_total),
     )
+    if teacher_loss_state.get("loss") is not None:
+        payload["teacher_loss"] = dict(
+            total=float(teacher_loss_state["loss"]),
+            cov=float(teacher_loss_state.get("cov") or 0.0),
+            budget=float(teacher_loss_state.get("budget") or 0.0),
+            nce=float(teacher_loss_state.get("nce") or 0.0),
+            step=int(teacher_loss_state.get("step") or 0),
+        )
     print0(json.dumps(payload), console=True)
+
+def _block_masks_for_teacher(model: nn.Module, input_seq: Tensor, docs: Tensor, window_blocks: Tensor):
+    long_bm, short_bm = model.create_blockmasks(input_seq, window_blocks, docs=docs)
+    block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm,
+                   short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+    if len(block_masks) != len(model.blocks):
+        raise ValueError(f"teacher block mask list len={len(block_masks)} != num_layers={len(model.blocks)}")
+    return block_masks
+
+def _select_teacher_heads(num_heads: int, device: torch.device) -> Tensor:
+    n = int(args.spectral_teacher_heads)
+    if n <= 0 or n >= num_heads:
+        return torch.arange(num_heads, device=device)
+    return torch.arange(n, device=device)
+
+def _teacher_disable_ctx():
+    if _dynamo is None:
+        return contextlib.nullcontext()
+    return _dynamo.disable()
+
+def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) -> Tensor | None:
+    if not args.spectral_teacher:
+        return None
+    every = int(args.spectral_teacher_every)
+    if every <= 0 or (step % every) != 0:
+        return None
+    if not spectral_bias_modules or not args.spectral_use_pointer_mask:
+        return None
+
+    teacher_len = int(args.spectral_teacher_len)
+    if teacher_len <= 0:
+        return None
+    if teacher_len > int(inputs.numel()):
+        teacher_len = int(inputs.numel())
+    teacher_len = teacher_len - (teacher_len % 128)
+    if teacher_len <= 0:
+        return None
+
+    model_unwrapped = _unwrap_compiled(model)
+    layer_idx = int(args.spectral_teacher_layer)
+    if layer_idx < 0 or layer_idx >= len(model_unwrapped.blocks):
+        raise ValueError(f"SPECTRAL_TEACHER_LAYER={layer_idx} out of range for num_layers={len(model_unwrapped.blocks)}")
+
+    with _teacher_disable_ctx():
+        device = inputs.device
+        input_seq = inputs[:teacher_len]
+        docs = (input_seq == 50256).cumsum(0)
+
+        # --- forward to the teacher layer (optionally with grad) ---
+        detach_backbone = bool(args.spectral_teacher_detach_backbone)
+        grad_ctx = torch.no_grad() if detach_backbone else contextlib.nullcontext()
+        with grad_ctx:
+            ve = [value_embed(input_seq) for value_embed in model_unwrapped.value_embeds]
+            ve = [ve[0], ve[1], ve[2]] + [None] * (len(model_unwrapped.blocks) - 6) + [ve[0], ve[1], ve[2]]
+            x = x0 = norm(model_unwrapped.embed(input_seq)[None])
+            skip_connections = []
+            n = len(model_unwrapped.skip_weights)
+            block_masks = _block_masks_for_teacher(model_unwrapped, input_seq, docs, window_blocks)
+            for i in range(layer_idx):
+                if i >= n:
+                    x = x + model_unwrapped.skip_weights[i - n] * skip_connections.pop()
+                x, _ = model_unwrapped.blocks[i](x, ve[i], x0, block_masks[i], docs)
+                if i < n:
+                    skip_connections.append(x)
+
+            attn = model_unwrapped.blocks[layer_idx].attn
+            x_attn = norm(x)
+            q, k, _ = (
+                F.linear(x_attn, attn.qkv_w.flatten(end_dim=1).type_as(x_attn))
+                .view(1, teacher_len, 3 * attn.num_heads, attn.head_dim)
+                .chunk(3, dim=-2)
+            )
+            q, k = norm(q), norm(k)
+            q_for_bias = q.transpose(1, 2)
+            q, k = attn.rotary(q), attn.rotary(k)
+
+        sb = attn.spectral_bias
+        if sb is None:
+            return None
+
+        # --- student parameters (grad only through SpectralBias) ---
+        dbg_prev = sb.debug_stats
+        sb.debug_stats = False
+        try:
+            (
+                coeff_cos,
+                coeff_sin,
+                slope,
+                _b0,
+                delta_star,
+                _pi,
+                budget_logits,
+                _delta_main,
+                _width,
+                cos_wD,
+                sin_wD,
+                _reg_loss,
+            ) = sb(q_for_bias.detach() if detach_backbone else q_for_bias, docs=docs)
+        finally:
+            sb.debug_stats = dbg_prev
+
+        # --- teacher dense attention (no grad) ---
+        with torch.no_grad():
+            q_bhtd = q.transpose(1, 2)  # [1,H,L,D]
+            k_bhtd = k.transpose(1, 2)
+            head_idx = _select_teacher_heads(attn.num_heads, device)
+            q_sel = q_bhtd[0, head_idx]  # [Hh,L,D]
+            k_sel = k_bhtd[0, head_idx]
+
+            use_slope = bool(sb.use_slope)
+            beta = float(sb.beta)
+            use_spectral = bool(args.spectral_bias)
+            if use_spectral:
+                K = int(sb.K)
+                cos_t = cos_wD.transpose(0, 1).to(dtype=torch.float32)  # [L,K]
+                sin_t = sin_wD.transpose(0, 1).to(dtype=torch.float32)  # [L,K]
+                cos_bhtk = cos_t[None, None].expand(1, attn.num_heads, teacher_len, K)
+                sin_bhtk = sin_t[None, None].expand(1, attn.num_heads, teacher_len, K)
+                Qcos = coeff_cos * cos_bhtk + coeff_sin * sin_bhtk
+                Qsin = coeff_cos * sin_bhtk - coeff_sin * cos_bhtk
+                q_pos = torch.cat([Qcos, Qsin], dim=-1)  # [1,H,L,2K]
+                k_pos = torch.cat([cos_bhtk, sin_bhtk], dim=-1)  # [1,H,L,2K]
+                if use_slope:
+                    pos = torch.arange(teacher_len, device=device, dtype=torch.float32)
+                    q_pos = torch.cat([q_pos, (-slope).unsqueeze(-1)], dim=-1)
+                    k_pos = torch.cat([k_pos, pos[None, None, :, None].expand(1, attn.num_heads, teacher_len, 1)], dim=-1)
+                s = math.sqrt(beta / float(attn.attn_scale))
+                q_pos = (q_pos * s).to(dtype=q_sel.dtype)
+                k_pos = (k_pos * s).to(dtype=k_sel.dtype)
+                q_pos = q_pos[0, head_idx]
+                k_pos = k_pos[0, head_idx]
+            else:
+                q_pos = None
+                k_pos = None
+
+            block_size = 128
+            num_blocks = teacher_len // block_size
+            k_idx = torch.arange(teacher_len, device=device, dtype=torch.int64)
+            k_blocks = torch.floor_divide(k_idx, block_size)
+            kb_idx = torch.arange(num_blocks, device=device, dtype=torch.int64)
+
+            teacher_mass = torch.zeros((q_sel.size(0), num_blocks, num_blocks), device=device, dtype=torch.float32)
+            for qb in range(num_blocks):
+                qs = qb * block_size
+                qe = qs + block_size
+                q_block = q_sel[:, qs:qe]
+                scores = torch.matmul(q_block, k_sel.transpose(-2, -1)) * float(attn.attn_scale)
+                if q_pos is not None and k_pos is not None:
+                    q_pos_block = q_pos[:, qs:qe]
+                    scores = scores + torch.matmul(q_pos_block, k_pos.transpose(-2, -1)) * float(attn.attn_scale)
+
+                q_idx = torch.arange(qs, qe, device=device, dtype=torch.int64)
+                docs_q = docs[qs:qe]
+                doc_mask = docs_q[:, None] == docs[None, :]
+                causal_mask = q_idx[:, None] >= k_idx[None, :]
+                mask = doc_mask & causal_mask
+                scores = scores.float().masked_fill(~mask, -1.0e9)
+                attn_w = torch.softmax(scores, dim=-1)
+                attn_sum = attn_w.sum(dim=1)
+                mass = torch.zeros((q_sel.size(0), num_blocks), device=device, dtype=torch.float32)
+                mass.scatter_add_(dim=1, index=k_blocks[None, :].expand(q_sel.size(0), -1), src=attn_sum)
+                teacher_mass[:, qb, :] = mass
+
+        # --- student inclusion probability (grad) ---
+        block_size = 128
+        num_blocks = teacher_len // block_size
+        q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int64)
+        t_rep = (q_blocks + 1) * block_size - 1
+        t_rep_l = t_rep.to(torch.long)
+        doc_change_tok = torch.ones((teacher_len,), device=device, dtype=torch.bool)
+        doc_change_tok[1:] = docs[1:] != docs[:-1]
+        tok_idx = torch.arange(teacher_len, device=device, dtype=torch.int64)
+        doc_start_token = torch.where(doc_change_tok, tok_idx, torch.zeros_like(tok_idx)).cummax(dim=0).values
+        doc_start_blk_ptr = torch.floor_divide(doc_start_token[t_rep_l], block_size).to(torch.int64)
+        block_start_tok = (q_blocks * int(block_size)).to(torch.long)
+        doc_start_blk_local = torch.floor_divide(doc_start_token[block_start_tok], block_size).to(torch.int64)
+
+        if sb.pointer_qblock_rep == "last":
+            delta_rep = delta_star[0, :, t_rep_l]
+            budget_rep = budget_logits[0, :, t_rep_l]
+        else:
+            delta_rep = delta_star[0].reshape(attn.num_heads, num_blocks, block_size, sb.M).mean(dim=2)
+            budget_rep = budget_logits[0].reshape(attn.num_heads, num_blocks, block_size, sb.M).mean(dim=2)
+
+        delta_rep = delta_rep[_select_teacher_heads(attn.num_heads, device)]
+        budget_rep = budget_rep[_select_teacher_heads(attn.num_heads, device)]
+        Hh = delta_rep.size(0)
+        M = int(sb.M)
+        local_blocks = min(int(sb.pointer_local_blocks), num_blocks)
+        ptr_half_active = int(sb._pointer_half_blocks_active.item())
+
+        budget_val = int(sb.pointer_budget_blocks)
+        if sb.pointer_budget_is_total:
+            budget_total = min(budget_val, int(local_blocks + M + (M * int(sb.pointer_half_blocks))))
+            budget_rem = max(budget_total - int(local_blocks) - int(M), 0)
+        else:
+            budget_rem = budget_val
+        budget_rem = min(int(budget_rem), int(M * max(ptr_half_active, 0)))
+        if budget_rem <= 0:
+            r_m = delta_rep.new_zeros(delta_rep.shape)
+        else:
+            temp = max(float(sb.pointer_budget_temp), 1e-6)
+            u = (budget_rep / temp).to(dtype=torch.float32)
+            rem = delta_rep.new_full((Hh, num_blocks), float(budget_rem), dtype=torch.float32)
+            alloc = delta_rep.new_zeros(delta_rep.shape, dtype=torch.float32)
+            for m in range(M - 1):
+                v = torch.sigmoid(u[..., m])
+                b = v * rem
+                alloc[..., m] = b
+                rem = rem - b
+            alloc[..., M - 1] = rem
+            r_m = torch.clamp(alloc, min=0.0, max=float(ptr_half_active))
+
+        key_tok = t_rep[None, :, None].to(delta_rep.dtype) - delta_rep
+        key_tok = key_tok.clamp(min=0.0)
+        center_blk = (key_tok / float(block_size)).to(dtype=torch.float32)
+        center_blk = torch.minimum(center_blk, q_blocks[None, :, None].to(center_blk.dtype))
+        if sb.pointer_doc_clamp:
+            center_blk = torch.maximum(center_blk, doc_start_blk_ptr[None, :, None].to(center_blk.dtype))
+
+        kb_idx = torch.arange(num_blocks, device=device, dtype=torch.float32)
+        kb_idx_i = kb_idx.to(torch.int64)
+        dist = (kb_idx[None, None, None, :] - center_blk[..., None]).abs()
+        temp_inc = max(float(args.spectral_teacher_temp), 1e-6)
+        p_m = torch.sigmoid((r_m[..., None] - dist) / temp_inc)
+        P = 1.0 - torch.prod(1.0 - p_m, dim=2)  # [Hh,QB,KB]
+
+        qb_idx = q_blocks[None, :, None].to(torch.int64)
+        local_start = (q_blocks - (local_blocks - 1)).clamp(min=0)
+        local_start = torch.maximum(local_start, doc_start_blk_local)
+        local_mask = (kb_idx_i[None, None, :] >= local_start[None, :, None]) & (kb_idx_i[None, None, :] <= qb_idx)
+
+        teacher_mass = teacher_mass[:, :num_blocks, :]
+        teacher_mass = teacher_mass.masked_fill(local_mask, 0.0)
+        t_sum = teacher_mass.sum(dim=-1, keepdim=True)
+        t_norm = teacher_mass / (t_sum + 1.0e-9)
+        valid = (t_sum.squeeze(-1) > 0)
+        cov = -(t_norm * torch.log(P + 1.0e-9)).sum(dim=-1)
+        cov = (cov * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+
+        valid_k = (kb_idx_i[None, None, :] >= doc_start_blk_local[None, :, None]) & (kb_idx_i[None, None, :] <= qb_idx)
+        valid_k = valid_k & (~local_mask)
+        expected = (P * valid_k.float()).sum(dim=-1)
+        max_extra = max(num_blocks - local_blocks, 0)
+        target_extra = float(min(budget_rem, max_extra))
+        budget = (expected - target_extra).square()
+        budget = (budget * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+
+        nce = None
+        if bool(args.spectral_teacher_nce):
+            pos_k = int(args.spectral_teacher_nce_pos)
+            neg_k = int(args.spectral_teacher_nce_neg)
+            pos_k = min(pos_k, num_blocks)
+            neg_k = min(neg_k, num_blocks)
+            if pos_k > 0 and neg_k > 0:
+                mass_for_topk = teacher_mass.masked_fill(~valid_k, -1.0e9)
+                pos_idx = torch.topk(mass_for_topk, k=pos_k, dim=-1).indices
+                gen = torch.Generator(device=device)
+                gen.manual_seed(int(args.seed) + 1000003 * int(step) + 917)
+                rand = torch.rand(mass_for_topk.shape, device=device, generator=gen)
+                rand = rand.masked_fill(~valid_k, -1.0)
+                neg_idx = torch.topk(rand, k=neg_k, dim=-1).indices
+
+                P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
+                logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
+                pos_scores = logits.gather(2, pos_idx)
+                neg_scores = logits.gather(2, neg_idx)
+                neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
+                pos_scores_exp = pos_scores.unsqueeze(-1)
+                all_scores = torch.cat([pos_scores_exp, neg_scores], dim=-1)
+                denom = torch.logsumexp(all_scores, dim=-1)
+                nce = (denom - pos_scores)
+                nce = (nce * valid.float().unsqueeze(-1)).sum() / valid.float().sum().clamp_min(1.0)
+
+        if nce is None:
+            nce = torch.zeros((), device=device, dtype=torch.float32)
+
+        loss = (
+            float(args.spectral_teacher_lambda_cov) * cov
+            + float(args.spectral_teacher_lambda_budget) * budget
+            + float(args.spectral_teacher_lambda_nce) * nce
+        )
+        teacher_loss_state["loss"] = float(loss.detach().item())
+        teacher_loss_state["cov"] = float(cov.detach().item())
+        teacher_loss_state["budget"] = float(budget.detach().item())
+        teacher_loss_state["nce"] = float(nce.detach().item())
+        teacher_loss_state["step"] = int(step)
+        return loss
 
 def _parse_csv_ints(s: str) -> list[int]:
     parts = [p.strip() for p in str(s).split(",")]
@@ -1526,6 +1971,8 @@ def get_window_size_blocks(step: int):
     return get_window_size_blocks_helper(window_size)
 
 maybe_update_pointer_mask(0)
+maybe_update_pointer_reset(0)
+maybe_update_gumbel_seed(0)
 maybe_update_delta_star_max(0)
 maybe_update_delta_edge_eps(0)
 compile_enabled = bool(args.torch_compile)
@@ -1661,6 +2108,8 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     maybe_update_pointer_mask(step)
+    maybe_update_pointer_reset(step)
+    maybe_update_gumbel_seed(step)
     maybe_update_delta_star_max(step)
     maybe_update_delta_edge_eps(step)
     last_step = (step == train_steps)
@@ -1671,6 +2120,8 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         val_pointer_forced = False
+        val_reset_forced = False
+        prev_reset_state = None
         if spectral_bias_modules and args.spectral_use_pointer_mask and args.spectral_pointer_val_force:
             val_pointer_forced = True
             hb = int(args.spectral_pointer_val_half_blocks)
@@ -1680,6 +2131,13 @@ for step in range(train_steps + 1):
                 sb.set_pointer_mask_state(enabled=True, half_blocks=hb)
             pointer_mask_state["enabled"] = True
             pointer_mask_state["half_blocks"] = hb
+        if spectral_bias_modules and pointer_reset_state.get("enabled"):
+            val_reset_forced = True
+            prev_reset_state = dict(pointer_reset_state)
+            for sb in spectral_bias_modules:
+                sb.set_pointer_reset_state(enabled=False, reset_len=0)
+            pointer_reset_state["enabled"] = False
+            pointer_reset_state["p_active"] = 0.0
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
@@ -1701,6 +2159,13 @@ for step in range(train_steps + 1):
         model.train()
         if val_pointer_forced:
             maybe_update_pointer_mask(step)
+        if val_reset_forced and prev_reset_state is not None:
+            for sb in spectral_bias_modules:
+                sb.set_pointer_reset_state(
+                    enabled=bool(prev_reset_state.get("enabled")),
+                    reset_len=int(prev_reset_state.get("reset_len") or 0),
+                )
+            pointer_reset_state.update(prev_reset_state)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1722,6 +2187,9 @@ for step in range(train_steps + 1):
     window_blocks = get_window_size_blocks(step)
     def _train_fwd_bwd():
         loss = model(inputs, targets, window_blocks)
+        teacher_loss = compute_teacher_loss(step=step, inputs=inputs, window_blocks=window_blocks)
+        if teacher_loss is not None:
+            loss = loss + teacher_loss
         loss.backward()
         return loss
     train_loss = run_with_compile_fallback(_train_fwd_bwd, where=f"train_fwd_bwd_step{step}")
