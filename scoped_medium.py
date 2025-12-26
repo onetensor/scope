@@ -722,6 +722,7 @@ class Hyperparameters:
     spectral_pointer_global_blocks_warmup = 2
     spectral_pointer_global_blocks_warmup_steps = 300
     spectral_pointer_qblock_rep = "last"  # "last"|"mean"
+    spectral_pointer_doc_clamp = True  # clamp local/pointer windows to doc start blocks
     spectral_pointer_schedule = True
     spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
@@ -837,6 +838,7 @@ args.spectral_pointer_radius_mode = _env_str("SPECTRAL_POINTER_RADIUS_MODE", arg
 args.spectral_pointer_global_blocks = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS", args.spectral_pointer_global_blocks)
 args.spectral_pointer_global_blocks_warmup = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP", args.spectral_pointer_global_blocks_warmup)
 args.spectral_pointer_global_blocks_warmup_steps = _env_int("SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS", args.spectral_pointer_global_blocks_warmup_steps)
+args.spectral_pointer_doc_clamp = _env_bool("SPECTRAL_POINTER_DOC_CLAMP", args.spectral_pointer_doc_clamp)
 args.spectral_pi_entropy_floor_frac = _env_float("SPECTRAL_PI_ENTROPY_FLOOR_FRAC", args.spectral_pi_entropy_floor_frac)
 args.spectral_lambda_delta_edge = _env_float("SPECTRAL_LAMBDA_DELTA_EDGE", args.spectral_lambda_delta_edge)
 args.spectral_delta_edge_eps = _env_float("SPECTRAL_DELTA_EDGE_EPS", args.spectral_delta_edge_eps)
@@ -1001,6 +1003,8 @@ print0(
                 pointer_global_blocks=int(args.spectral_pointer_global_blocks),
                 pointer_global_blocks_warmup=int(args.spectral_pointer_global_blocks_warmup),
                 pointer_global_blocks_warmup_steps=int(args.spectral_pointer_global_blocks_warmup_steps),
+                pointer_qblock_rep=str(args.spectral_pointer_qblock_rep),
+                pointer_doc_clamp=bool(args.spectral_pointer_doc_clamp),
                 val_force=bool(args.spectral_pointer_val_force),
                 val_half_blocks=int(args.spectral_pointer_val_half_blocks),
                 pi_entropy_floor_frac=float(args.spectral_pi_entropy_floor_frac),
@@ -1055,12 +1059,13 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, m
                                 int(args.spectral_pointer_global_blocks),
                                 int(args.spectral_pointer_global_blocks_warmup),
                             ),
-                           pointer_qblock_rep=args.spectral_pointer_qblock_rep,
-                           pi_entropy_floor_frac=args.spectral_pi_entropy_floor_frac,
-                           lambda_delta_edge=args.spectral_lambda_delta_edge,
-                           delta_edge_eps=args.spectral_delta_edge_eps,
-                           lambda_omega=args.spectral_lambda_omega,
-                           lambda_zero_mean=args.spectral_lambda_zero_mean,
+                            pointer_qblock_rep=args.spectral_pointer_qblock_rep,
+                            pointer_doc_clamp=args.spectral_pointer_doc_clamp,
+                            pi_entropy_floor_frac=args.spectral_pi_entropy_floor_frac,
+                            lambda_delta_edge=args.spectral_lambda_delta_edge,
+                            delta_edge_eps=args.spectral_delta_edge_eps,
+                            lambda_omega=args.spectral_lambda_omega,
+                            lambda_zero_mean=args.spectral_lambda_zero_mean,
                            lambda_entropy=args.spectral_lambda_entropy,
                            debug_stats=master_process,
                        )).cuda()
@@ -1304,6 +1309,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             radius_mode=str(sb0.pointer_radius_mode),
             global_blocks_max=int(sb0.pointer_global_blocks),
             qblock_rep=str(sb0.pointer_qblock_rep),
+            doc_clamp=bool(sb0.pointer_doc_clamp),
         ),
         delta_star_max_active=(int(delta_star_max_state["max_tokens"]) if delta_star_max_state.get("max_tokens") is not None else None),
         kv_unique_blocks=dict(mean=kv_mean, p50=kv_p50, p90=kv_p90, min=kv_min, max=kv_max),

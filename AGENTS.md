@@ -42,6 +42,7 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
 - `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this extra block budget across peaks)
 - `SPECTRAL_POINTER_RADIUS_MODE=fixed|pi`
+- `SPECTRAL_POINTER_DOC_CLAMP=0|1` (clamp local/pointer windows to the current doc start blocks)
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP=<int>`
 - `SPECTRAL_POINTER_GLOBAL_BLOCKS_WARMUP_STEPS=<int>`

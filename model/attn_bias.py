@@ -47,6 +47,7 @@ class SpectralBiasConfig:
     # "pi" -> per-peak radii derived from π + `pointer_budget_blocks`
     pointer_radius_mode: str = "pi"
     pointer_qblock_rep: str = "last"  # "last"|"mean"
+    pointer_doc_clamp: bool = True
     # debug/telemetry (rank0 recommended)
     debug_stats: bool = False
     # π entropy regularization: only penalize collapse below this floor
@@ -95,6 +96,7 @@ class SpectralBias(nn.Module):
         pointer_budget_blocks: int = 0,
         pointer_radius_mode: str = "pi",
         pointer_qblock_rep: str = "last",
+        pointer_doc_clamp: bool = True,
         lambda_omega: float = 1e-5,
         lambda_zero_mean: float = 1e-4,
         lambda_entropy: float = 1e-4,
@@ -143,6 +145,7 @@ class SpectralBias(nn.Module):
         self.pointer_qblock_rep = str(pointer_qblock_rep)
         if self.pointer_qblock_rep not in {"last", "mean"}:
             raise ValueError("pointer_qblock_rep must be one of: last|mean")
+        self.pointer_doc_clamp = bool(pointer_doc_clamp)
         self.debug_stats = bool(debug_stats)
         self.register_buffer(
             "_pointer_mask_active",
@@ -484,13 +487,27 @@ class SpectralBias(nn.Module):
                 # Doc-aware clamp: avoid wasting pointer budget pointing before the current doc
                 # (those entries are masked out anyway). This reduces apparent block-0 collapse.
                 if docs is not None:
-                    docs_rep = docs[t_rep.to(torch.long)].to(torch.int64)  # [QB]
-                    doc_change = torch.ones_like(docs_rep, dtype=torch.bool)
-                    doc_change[1:] = docs_rep[1:] != docs_rep[:-1]
-                    doc_starts = torch.where(doc_change, q_blocks, torch.zeros_like(q_blocks))
-                    doc_start_blk = doc_starts.cummax(dim=0).values  # [QB]
-                    ptr_center_blk = torch.maximum(ptr_center_blk, doc_start_blk[None, :, None])
-                    self._dbg_ptr_docstart_frac.copy_((ptr_center_blk == doc_start_blk[None, :, None]).float().mean())
+                    # docs can change within blocks, so estimate doc starts at token granularity
+                    doc_change_tok = torch.ones((L,), device=device, dtype=torch.bool)
+                    doc_change_tok[1:] = docs[1:] != docs[:-1]
+                    tok_idx = torch.arange(L, device=device, dtype=torch.int64)
+                    doc_start_token = torch.where(doc_change_tok, tok_idx, torch.zeros_like(tok_idx)).cummax(dim=0).values
+
+                    doc_start_blk_ptr = torch.floor_divide(doc_start_token[t_rep.to(torch.long)], block_size).to(
+                        torch.int64
+                    )  # [QB]
+                    block_start_tok = (q_blocks * int(block_size)).to(torch.long)  # [QB]
+                    doc_start_blk_local = torch.floor_divide(doc_start_token[block_start_tok], block_size).to(
+                        torch.int64
+                    )  # [QB]
+
+                    if self.pointer_doc_clamp:
+                        ptr_center_blk = torch.maximum(ptr_center_blk, doc_start_blk_ptr[None, :, None])
+                        self._dbg_ptr_docstart_frac.copy_(
+                            (ptr_center_blk == doc_start_blk_ptr[None, :, None]).float().mean()
+                        )
+                    else:
+                        self._dbg_ptr_docstart_frac.zero_()
                 else:
                     self._dbg_ptr_docstart_frac.zero_()
 
@@ -500,8 +517,8 @@ class SpectralBias(nn.Module):
 
                 local_blocks = min(self.pointer_local_blocks, num_blocks)
                 local_start = (q_blocks - (local_blocks - 1)).clamp(min=0)
-                if docs is not None:
-                    local_start = torch.maximum(local_start, doc_start_blk)
+                if docs is not None and self.pointer_doc_clamp:
+                    local_start = torch.maximum(local_start, doc_start_blk_local)
                 outside = ptr_center_blk < local_start[None, :, None]
                 self._dbg_ptr_outside_local_frac.copy_(outside.float().mean())
                 self._dbg_ptr_block0_frac.copy_((ptr_center_blk == 0).float().mean())
@@ -593,14 +610,23 @@ class SpectralBias(nn.Module):
         q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int32)   
         t_rep = (q_blocks + 1) * block_size - 1  # [QB]
         t_rep_l = t_rep.to(torch.long)
-        # Per-query-block start of the current document (in blocks). This is used to
-        # avoid wasting KV budget on blocks that will be masked out by the doc-aware
-        # token-level `mask_mod`.
-        docs_rep = docs[t_rep_l].to(torch.int64)  # [QB]
-        doc_change = torch.ones_like(docs_rep, dtype=torch.bool)
-        doc_change[1:] = docs_rep[1:] != docs_rep[:-1]
-        doc_starts = torch.where(doc_change, q_blocks, torch.zeros_like(q_blocks))
-        doc_start_blk = doc_starts.cummax(dim=0).values  # [QB]
+        # Doc-start estimation (token-level): docs can change within blocks, so we
+        # derive a per-token `doc_start_token` via change points + cummax, then gather
+        # at representative tokens.
+        # doc_start_token[t] = most recent index where docs changed (start of current doc)
+        doc_change_tok = torch.ones((T,), device=device, dtype=torch.bool)
+        doc_change_tok[1:] = docs[1:] != docs[:-1]
+        tok_idx = torch.arange(T, device=device, dtype=torch.int32)
+        doc_start_token = torch.where(doc_change_tok, tok_idx, torch.zeros_like(tok_idx)).cummax(dim=0).values  # [T]
+        # Doc start block for the representative token's doc (used for pointer clamp).
+        doc_start_blk_ptr = torch.floor_divide(doc_start_token[t_rep_l], block_size).to(torch.int32)  # [QB]
+        # Doc start block for the *first* token in the query block (used for the local band).
+        # This avoids collapsing the whole local band when doc boundaries occur inside a block.
+        block_start_tok = (q_blocks.to(torch.int64) * int(block_size)).to(torch.long)  # [QB]
+        doc_start_blk_local = torch.floor_divide(doc_start_token[block_start_tok], block_size).to(torch.int32)  # [QB]
+        if not self.pointer_doc_clamp:
+            doc_start_blk_ptr = torch.zeros_like(doc_start_blk_ptr)
+            doc_start_blk_local = torch.zeros_like(doc_start_blk_local)
         ptr_enabled = self._pointer_mask_active.to(device=device, dtype=torch.int32)
         ptr_half_active = self._pointer_half_blocks_active.to(device=device, dtype=torch.int32)
 
@@ -633,7 +659,7 @@ class SpectralBias(nn.Module):
         ptr_center_blk = torch.floor_divide(key_tok.to(torch.int64), block_size).to(torch.int32)  # [H,QB,M]
         ptr_center_blk = torch.minimum(ptr_center_blk, q_blocks[None, :, None])
         ptr_center_blk = torch.where(ptr_enabled.bool(), ptr_center_blk, q_blocks[None, :, None].expand(H, -1, M))
-        ptr_center_blk = torch.maximum(ptr_center_blk, doc_start_blk[None, :, None])
+        ptr_center_blk = torch.maximum(ptr_center_blk, doc_start_blk_ptr[None, :, None])
 
         pieces = []
 
@@ -641,7 +667,7 @@ class SpectralBias(nn.Module):
         local_blocks = min(local_blocks, num_blocks)
         offs_local = torch.arange(local_blocks, device=device, dtype=torch.int32)
         local = (q_blocks[None, :, None] - offs_local[None, None, :]).clamp(min=0)
-        local = torch.maximum(local, doc_start_blk[None, :, None])
+        local = torch.maximum(local, doc_start_blk_local[None, :, None])
         pieces.append(local.expand(H, -1, -1))
 
         # (2) pointer windows around each Δ*_m: [center-p ... center+p]
@@ -652,7 +678,7 @@ class SpectralBias(nn.Module):
             ptr = ptr_center_blk[:, :, :, None] + offs_ptr[None, None, None, :]
             ptr = ptr.clamp(min=0, max=num_blocks - 1)
             ptr = torch.minimum(ptr, q_blocks[None, :, None, None])
-            ptr = torch.maximum(ptr, doc_start_blk[None, :, None, None])
+            ptr = torch.maximum(ptr, doc_start_blk_ptr[None, :, None, None])
             ptr = torch.where(active, ptr, ptr_center_blk[:, :, :, None])
             pieces.append(ptr.flatten(2, 3))  # [H,QB,M*(2p+1)]
         else:
@@ -663,7 +689,7 @@ class SpectralBias(nn.Module):
         if global_max > 0:
             # Doc-local anchors: doc_start_blk + [0..G-1], clamped by causality.
             g = torch.arange(global_max, device=device, dtype=torch.int32)
-            g = doc_start_blk[None, :, None] + g[None, None, :]
+            g = doc_start_blk_ptr[None, :, None] + g[None, None, :]
             g = torch.minimum(g, q_blocks[None, :, None]).expand(H, -1, -1)
             if global_blocks is None:
                 gb_active = self._pointer_global_blocks_active.to(device=device, dtype=torch.int32)
