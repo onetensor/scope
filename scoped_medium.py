@@ -1505,10 +1505,20 @@ def _select_teacher_heads(num_heads: int, device: torch.device) -> Tensor:
         return torch.arange(num_heads, device=device)
     return torch.arange(n, device=device)
 
+@contextlib.contextmanager
 def _teacher_disable_ctx():
     if _dynamo is None:
-        return contextlib.nullcontext()
-    return _dynamo.disable()
+        yield
+        return
+    try:
+        ctx = _dynamo.disable()
+        if hasattr(ctx, "__enter__") and hasattr(ctx, "__exit__"):
+            with ctx:
+                yield
+                return
+    except Exception:
+        pass
+    yield
 
 def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) -> Tensor | None:
     if not args.spectral_teacher:
