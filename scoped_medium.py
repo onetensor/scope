@@ -1301,6 +1301,9 @@ teacher_stats_state = dict(
     n_valid_blocks=0,
     n_pos=0,
     n_neg=0,
+    teacher_nce_used=False,
+    teacher_nce_pos_used=0,
+    teacher_nce_neg_used=0,
     teacher_target_entropy=0.0,
     teacher_top1_mass=0.0,
     step=None,
@@ -1507,6 +1510,9 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         payload["n_valid_blocks"] = int(teacher_stats_state.get("n_valid_blocks") or 0)
         payload["n_pos"] = int(teacher_stats_state.get("n_pos") or 0)
         payload["n_neg"] = int(teacher_stats_state.get("n_neg") or 0)
+        payload["teacher_nce_used"] = bool(teacher_stats_state.get("teacher_nce_used"))
+        payload["teacher_nce_pos_used"] = int(teacher_stats_state.get("teacher_nce_pos_used") or 0)
+        payload["teacher_nce_neg_used"] = int(teacher_stats_state.get("teacher_nce_neg_used") or 0)
         payload["teacher_target_entropy"] = float(teacher_stats_state.get("teacher_target_entropy") or 0.0)
         payload["teacher_top1_mass"] = float(teacher_stats_state.get("teacher_top1_mass") or 0.0)
         payload["teacher_stats_step"] = int(teacher_stats_state.get("step") or 0)
@@ -1549,15 +1555,18 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         if teacher_stats_state.get("step") is None:
             teacher_stats_state.update(
                 teacher_ran=False,
-                teacher_skip_reason="not_time",
-                n_valid_q=0,
-                n_valid_blocks=0,
-                n_pos=0,
-                n_neg=0,
-                teacher_target_entropy=0.0,
-                teacher_top1_mass=0.0,
-                step=None,
-            )
+            teacher_skip_reason="not_time",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=None,
+        )
         return None
     if not spectral_bias_modules or not args.spectral_use_pointer_mask:
         teacher_stats_state.update(
@@ -1567,6 +1576,9 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
             n_valid_blocks=0,
             n_pos=0,
             n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
             teacher_target_entropy=0.0,
             teacher_top1_mass=0.0,
             step=int(step),
@@ -1583,6 +1595,9 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
             n_valid_blocks=0,
             n_pos=0,
             n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
             teacher_target_entropy=0.0,
             teacher_top1_mass=0.0,
             step=int(step),
@@ -1600,6 +1615,9 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
             n_valid_blocks=0,
             n_pos=0,
             n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
             teacher_target_entropy=0.0,
             teacher_top1_mass=0.0,
             step=int(step),
@@ -1810,17 +1828,20 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         if n_valid_q <= 0:
             teacher_stats_state.update(
                 teacher_ran=True,
-                teacher_skip_reason="no_valid_tokens",
-                n_valid_q=0,
-                n_valid_blocks=0,
-                n_pos=0,
-                n_neg=0,
-                teacher_target_entropy=0.0,
-                teacher_top1_mass=0.0,
-                step=int(step),
-            )
-            teacher_loss_state["loss"] = None
-            return None
+            teacher_skip_reason="no_valid_tokens",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
+        teacher_loss_state["loss"] = None
+        return None
 
         t_norm = teacher_mass / (t_sum + 1.0e-9)
         valid_k = (kb_idx_i[None, None, :] >= doc_start_blk_local[None, :, None]) & (kb_idx_i[None, None, :] <= qb_idx)
@@ -1829,17 +1850,20 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         if n_valid_blocks <= 0:
             teacher_stats_state.update(
                 teacher_ran=True,
-                teacher_skip_reason="no_valid_blocks",
-                n_valid_q=n_valid_q,
-                n_valid_blocks=0,
-                n_pos=0,
-                n_neg=0,
-                teacher_target_entropy=0.0,
-                teacher_top1_mass=0.0,
-                step=int(step),
-            )
-            teacher_loss_state["loss"] = None
-            return None
+            teacher_skip_reason="no_valid_blocks",
+            n_valid_q=n_valid_q,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
+        teacher_loss_state["loss"] = None
+        return None
 
         valid_denom = valid.float().sum().clamp_min(1.0)
         t_norm_safe = t_norm.clamp_min(1.0e-9)
@@ -1858,45 +1882,78 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         nce = torch.zeros((), device=device, dtype=torch.float32)
         n_pos = 0
         n_neg = 0
+        nce_used = False
+        nce_pos_used = 0
+        nce_neg_used = 0
         skip_reason = "not_time"
         if bool(args.spectral_teacher_nce):
-            pos_k = min(int(args.spectral_teacher_nce_pos), num_blocks)
-            neg_k = min(int(args.spectral_teacher_nce_neg), num_blocks)
-            n_pos = max(pos_k, 0)
-            n_neg = max(neg_k, 0)
-            if pos_k <= 0:
+            pos_k_cfg = min(int(args.spectral_teacher_nce_pos), num_blocks)
+            neg_k_cfg = min(int(args.spectral_teacher_nce_neg), num_blocks)
+            if pos_k_cfg <= 0:
                 skip_reason = "no_pos"
-            elif neg_k <= 0:
+            elif neg_k_cfg <= 0:
                 skip_reason = "no_neg"
             else:
                 valid_k_q = valid_k.squeeze(0).sum(dim=-1)
-                nce_valid = valid & (valid_k_q[None, :] >= pos_k) & (valid_k_q[None, :] >= neg_k)
-                if int(nce_valid.sum().item()) <= 0:
+                max_valid = int(valid_k_q.max().item()) if valid_k_q.numel() > 0 else 0
+                if max_valid <= 1:
                     skip_reason = "no_neg"
                 else:
-                    mass_for_topk = teacher_mass.masked_fill(~valid_k, -1.0e9)
-                    pos_idx = torch.topk(mass_for_topk, k=pos_k, dim=-1).indices
-                    gen = torch.Generator(device=device)
-                    gen.manual_seed(int(args.seed) + 1000003 * int(step) + 917)
-                    rand = torch.rand(mass_for_topk.shape, device=device, generator=gen)
-                    rand = rand.masked_fill(~valid_k, -1.0)
-                    neg_idx = torch.topk(rand, k=neg_k, dim=-1).indices
+                    pos_k = min(pos_k_cfg, max_valid)
+                    neg_k = min(neg_k_cfg, max_valid - pos_k)
+                    if neg_k <= 0 and max_valid > 1:
+                        pos_k = min(pos_k, max_valid - 1)
+                        neg_k = min(neg_k_cfg, max_valid - pos_k)
+                    if pos_k <= 0:
+                        skip_reason = "no_pos"
+                    elif neg_k <= 0:
+                        skip_reason = "no_neg"
+                    else:
+                        valid_k_h = valid_k.expand(Hh, -1, -1)
+                        nce_valid = valid & (valid_k_q[None, :] >= (pos_k + neg_k))
+                        if int(nce_valid.sum().item()) <= 0:
+                            skip_reason = "no_neg"
+                        else:
+                            mass_for_topk = teacher_mass.masked_fill(~valid_k_h, -1.0e9)
+                            pos_idx = torch.topk(mass_for_topk, k=pos_k, dim=-1).indices
+                            pos_valid = valid_k_h.gather(2, pos_idx)
+                            pos_mask_full = torch.zeros_like(valid_k_h, dtype=torch.bool)
+                            pos_mask_full.scatter_(2, pos_idx, pos_valid)
 
-                    P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
-                    logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
-                    pos_scores = logits.gather(2, pos_idx)
-                    neg_scores = logits.gather(2, neg_idx)
-                    neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
-                    pos_scores_exp = pos_scores.unsqueeze(-1)
-                    all_scores = torch.cat([pos_scores_exp, neg_scores], dim=-1)
-                    denom = torch.logsumexp(all_scores, dim=-1)
-                    nce_val = (denom - pos_scores)
-                    nce = (nce_val * nce_valid.float().unsqueeze(-1)).sum() / (
-                        nce_valid.float().sum().clamp_min(1.0) * float(pos_k)
-                    )
-                    n_pos = pos_k
-                    n_neg = neg_k
-                    skip_reason = "not_time"
+                            gen = torch.Generator(device=device)
+                            gen.manual_seed(int(args.seed) + 1000003 * int(step) + 917)
+                            rand = torch.rand(mass_for_topk.shape, device=device, generator=gen)
+                            rand = rand.masked_fill(~valid_k_h, -1.0)
+                            rand = rand.masked_fill(pos_mask_full, -1.0)
+                            neg_idx = torch.topk(rand, k=neg_k, dim=-1).indices
+                            neg_valid = valid_k_h.gather(2, neg_idx)
+                            neg_valid = neg_valid & (~pos_mask_full.gather(2, neg_idx))
+
+                            pos_count = pos_valid.sum(dim=-1)
+                            neg_count = neg_valid.sum(dim=-1)
+                            nce_valid = nce_valid & (pos_count > 0) & (neg_count > 0)
+                            if int(nce_valid.sum().item()) <= 0:
+                                skip_reason = "no_neg"
+                            else:
+                                P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
+                                logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
+                                pos_scores = logits.gather(2, pos_idx)
+                                neg_scores = logits.gather(2, neg_idx)
+                                neg_scores = neg_scores.masked_fill(~neg_valid, -1.0e9)
+                                neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
+                                pos_scores_exp = pos_scores.unsqueeze(-1)
+                                all_scores = torch.cat([pos_scores_exp, neg_scores], dim=-1)
+                                denom = torch.logsumexp(all_scores, dim=-1)
+                                nce_val = (denom - pos_scores)
+                                pos_mask = pos_valid & nce_valid.unsqueeze(-1)
+                                pos_mask_f = pos_mask.float()
+                                nce = (nce_val * pos_mask_f).sum() / pos_mask_f.sum().clamp_min(1.0)
+                                n_pos = int(pos_k)
+                                n_neg = int(neg_k)
+                                nce_used = True
+                                nce_pos_used = int(pos_k)
+                                nce_neg_used = int(neg_k)
+                                skip_reason = "not_time"
         else:
             skip_reason = "no_neg"
 
@@ -1908,6 +1965,9 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
                 n_valid_blocks=n_valid_blocks,
                 n_pos=n_pos,
                 n_neg=n_neg,
+                teacher_nce_used=bool(nce_used),
+                teacher_nce_pos_used=int(nce_pos_used),
+                teacher_nce_neg_used=int(nce_neg_used),
                 teacher_target_entropy=teacher_target_entropy,
                 teacher_top1_mass=teacher_top1_mass,
                 step=int(step),
@@ -1922,6 +1982,9 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
             n_valid_blocks=n_valid_blocks,
             n_pos=n_pos,
             n_neg=n_neg,
+            teacher_nce_used=bool(nce_used),
+            teacher_nce_pos_used=int(nce_pos_used),
+            teacher_nce_neg_used=int(nce_neg_used),
             teacher_target_entropy=teacher_target_entropy,
             teacher_top1_mass=teacher_top1_mass,
             step=int(step),
@@ -1946,6 +2009,9 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
             n_valid_blocks=0,
             n_pos=0,
             n_neg=0,
+            teacher_nce_used=False,
+            teacher_nce_pos_used=0,
+            teacher_nce_neg_used=0,
             teacher_target_entropy=0.0,
             teacher_top1_mass=0.0,
             step=int(step),
