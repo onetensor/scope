@@ -1509,6 +1509,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         payload["n_neg"] = int(teacher_stats_state.get("n_neg") or 0)
         payload["teacher_target_entropy"] = float(teacher_stats_state.get("teacher_target_entropy") or 0.0)
         payload["teacher_top1_mass"] = float(teacher_stats_state.get("teacher_top1_mass") or 0.0)
+        payload["teacher_stats_step"] = int(teacher_stats_state.get("step") or 0)
     print0(json.dumps(payload), console=True)
 
 def _block_masks_for_teacher(model: nn.Module, input_seq: Tensor, docs: Tensor, window_blocks: Tensor):
@@ -1545,17 +1546,18 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         return None
     every = int(args.spectral_teacher_every)
     if every <= 0 or (step % every) != 0:
-        teacher_stats_state.update(
-            teacher_ran=False,
-            teacher_skip_reason="not_time",
-            n_valid_q=0,
-            n_valid_blocks=0,
-            n_pos=0,
-            n_neg=0,
-            teacher_target_entropy=0.0,
-            teacher_top1_mass=0.0,
-            step=int(step),
-        )
+        if teacher_stats_state.get("step") is None:
+            teacher_stats_state.update(
+                teacher_ran=False,
+                teacher_skip_reason="not_time",
+                n_valid_q=0,
+                n_valid_blocks=0,
+                n_pos=0,
+                n_neg=0,
+                teacher_target_entropy=0.0,
+                teacher_top1_mass=0.0,
+                step=None,
+            )
         return None
     if not spectral_bias_modules or not args.spectral_use_pointer_mask:
         teacher_stats_state.update(
