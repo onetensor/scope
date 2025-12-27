@@ -1294,6 +1294,17 @@ def maybe_update_pointer_reset(step: int):
     pointer_reset_state["p_active"] = p_active
 
 teacher_loss_state = dict(loss=None, cov=None, budget=None, nce=None, step=None)
+teacher_stats_state = dict(
+    teacher_ran=False,
+    teacher_skip_reason="not_time",
+    n_valid_q=0,
+    n_valid_blocks=0,
+    n_pos=0,
+    n_neg=0,
+    teacher_target_entropy=0.0,
+    teacher_top1_mass=0.0,
+    step=None,
+)
 def maybe_update_gumbel_seed(step: int):
     if not spectral_bias_modules:
         return
@@ -1489,6 +1500,15 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             nce=float(teacher_loss_state.get("nce") or 0.0),
             step=int(teacher_loss_state.get("step") or 0),
         )
+    if args.spectral_teacher:
+        payload["teacher_ran"] = bool(teacher_stats_state.get("teacher_ran"))
+        payload["teacher_skip_reason"] = str(teacher_stats_state.get("teacher_skip_reason") or "not_time")
+        payload["n_valid_q"] = int(teacher_stats_state.get("n_valid_q") or 0)
+        payload["n_valid_blocks"] = int(teacher_stats_state.get("n_valid_blocks") or 0)
+        payload["n_pos"] = int(teacher_stats_state.get("n_pos") or 0)
+        payload["n_neg"] = int(teacher_stats_state.get("n_neg") or 0)
+        payload["teacher_target_entropy"] = float(teacher_stats_state.get("teacher_target_entropy") or 0.0)
+        payload["teacher_top1_mass"] = float(teacher_stats_state.get("teacher_top1_mass") or 0.0)
     print0(json.dumps(payload), console=True)
 
 def _block_masks_for_teacher(model: nn.Module, input_seq: Tensor, docs: Tensor, window_blocks: Tensor):
@@ -1499,7 +1519,7 @@ def _block_masks_for_teacher(model: nn.Module, input_seq: Tensor, docs: Tensor, 
         raise ValueError(f"teacher block mask list len={len(block_masks)} != num_layers={len(model.blocks)}")
     return block_masks
 
-def _select_teacher_heads(num_heads: int, device: torch.device) -> Tensor:
+def _select_teacher_heads(num_heads: int, device: torch.device) -> Tensor:      
     n = int(args.spectral_teacher_heads)
     if n <= 0 or n >= num_heads:
         return torch.arange(num_heads, device=device)
@@ -1525,17 +1545,64 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         return None
     every = int(args.spectral_teacher_every)
     if every <= 0 or (step % every) != 0:
+        teacher_stats_state.update(
+            teacher_ran=False,
+            teacher_skip_reason="not_time",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
         return None
     if not spectral_bias_modules or not args.spectral_use_pointer_mask:
+        teacher_stats_state.update(
+            teacher_ran=False,
+            teacher_skip_reason="exception",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
+        teacher_loss_state["loss"] = None
         return None
 
     teacher_len = int(args.spectral_teacher_len)
     if teacher_len <= 0:
+        teacher_stats_state.update(
+            teacher_ran=False,
+            teacher_skip_reason="no_valid_tokens",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
+        teacher_loss_state["loss"] = None
         return None
     if teacher_len > int(inputs.numel()):
         teacher_len = int(inputs.numel())
     teacher_len = teacher_len - (teacher_len % 128)
     if teacher_len <= 0:
+        teacher_stats_state.update(
+            teacher_ran=False,
+            teacher_skip_reason="no_valid_tokens",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
+        teacher_loss_state["loss"] = None
         return None
 
     model_unwrapped = _unwrap_compiled(model)
@@ -1543,38 +1610,39 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
     if layer_idx < 0 or layer_idx >= len(model_unwrapped.blocks):
         raise ValueError(f"SPECTRAL_TEACHER_LAYER={layer_idx} out of range for num_layers={len(model_unwrapped.blocks)}")
 
-    with _teacher_disable_ctx():
-        device = inputs.device
-        input_seq = inputs[:teacher_len]
-        docs = (input_seq == 50256).cumsum(0)
+    try:
+        with _teacher_disable_ctx():
+            device = inputs.device
+            input_seq = inputs[:teacher_len]
+            docs = (input_seq == 50256).cumsum(0)
 
-        # --- forward to the teacher layer (optionally with grad) ---
-        detach_backbone = bool(args.spectral_teacher_detach_backbone)
-        grad_ctx = torch.no_grad() if detach_backbone else contextlib.nullcontext()
-        with grad_ctx:
-            ve = [value_embed(input_seq) for value_embed in model_unwrapped.value_embeds]
-            ve = [ve[0], ve[1], ve[2]] + [None] * (len(model_unwrapped.blocks) - 6) + [ve[0], ve[1], ve[2]]
-            x = x0 = norm(model_unwrapped.embed(input_seq)[None])
-            skip_connections = []
-            n = len(model_unwrapped.skip_weights)
-            block_masks = _block_masks_for_teacher(model_unwrapped, input_seq, docs, window_blocks)
-            for i in range(layer_idx):
-                if i >= n:
-                    x = x + model_unwrapped.skip_weights[i - n] * skip_connections.pop()
-                x, _ = model_unwrapped.blocks[i](x, ve[i], x0, block_masks[i], docs)
-                if i < n:
-                    skip_connections.append(x)
+            # --- forward to the teacher layer (optionally with grad) ---
+            detach_backbone = bool(args.spectral_teacher_detach_backbone)
+            grad_ctx = torch.no_grad() if detach_backbone else contextlib.nullcontext()
+            with grad_ctx:
+                ve = [value_embed(input_seq) for value_embed in model_unwrapped.value_embeds]
+                ve = [ve[0], ve[1], ve[2]] + [None] * (len(model_unwrapped.blocks) - 6) + [ve[0], ve[1], ve[2]]
+                x = x0 = norm(model_unwrapped.embed(input_seq)[None])
+                skip_connections = []
+                n = len(model_unwrapped.skip_weights)
+                block_masks = _block_masks_for_teacher(model_unwrapped, input_seq, docs, window_blocks)
+                for i in range(layer_idx):
+                    if i >= n:
+                        x = x + model_unwrapped.skip_weights[i - n] * skip_connections.pop()
+                    x, _ = model_unwrapped.blocks[i](x, ve[i], x0, block_masks[i], docs)
+                    if i < n:
+                        skip_connections.append(x)
 
-            attn = model_unwrapped.blocks[layer_idx].attn
-            x_attn = norm(x)
-            q, k, _ = (
-                F.linear(x_attn, attn.qkv_w.flatten(end_dim=1).type_as(x_attn))
-                .view(1, teacher_len, 3 * attn.num_heads, attn.head_dim)
-                .chunk(3, dim=-2)
-            )
-            q, k = norm(q), norm(k)
-            q_for_bias = q.transpose(1, 2)
-            q, k = attn.rotary(q), attn.rotary(k)
+                attn = model_unwrapped.blocks[layer_idx].attn
+                x_attn = norm(x)
+                q, k, _ = (
+                    F.linear(x_attn, attn.qkv_w.flatten(end_dim=1).type_as(x_attn))
+                    .view(1, teacher_len, 3 * attn.num_heads, attn.head_dim)
+                    .chunk(3, dim=-2)
+                )
+                q, k = norm(q), norm(k)
+                q_for_bias = q.transpose(1, 2)
+                q, k = attn.rotary(q), attn.rotary(k)
 
         sb = attn.spectral_bias
         if sb is None:
@@ -1663,19 +1731,19 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
                 mass.scatter_add_(dim=1, index=k_blocks[None, :].expand(q_sel.size(0), -1), src=attn_sum)
                 teacher_mass[:, qb, :] = mass
 
-        # --- student inclusion probability (grad) ---
-        block_size = 128
-        num_blocks = teacher_len // block_size
-        q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int64)
-        t_rep = (q_blocks + 1) * block_size - 1
-        t_rep_l = t_rep.to(torch.long)
-        doc_change_tok = torch.ones((teacher_len,), device=device, dtype=torch.bool)
-        doc_change_tok[1:] = docs[1:] != docs[:-1]
-        tok_idx = torch.arange(teacher_len, device=device, dtype=torch.int64)
-        doc_start_token = torch.where(doc_change_tok, tok_idx, torch.zeros_like(tok_idx)).cummax(dim=0).values
-        doc_start_blk_ptr = torch.floor_divide(doc_start_token[t_rep_l], block_size).to(torch.int64)
-        block_start_tok = (q_blocks * int(block_size)).to(torch.long)
-        doc_start_blk_local = torch.floor_divide(doc_start_token[block_start_tok], block_size).to(torch.int64)
+            # --- student inclusion probability (grad) ---
+            block_size = 128
+            num_blocks = teacher_len // block_size
+            q_blocks = torch.arange(num_blocks, device=device, dtype=torch.int64)
+            t_rep = (q_blocks + 1) * block_size - 1
+            t_rep_l = t_rep.to(torch.long)
+            doc_change_tok = torch.ones((teacher_len,), device=device, dtype=torch.bool)
+            doc_change_tok[1:] = docs[1:] != docs[:-1]
+            tok_idx = torch.arange(teacher_len, device=device, dtype=torch.int64)
+            doc_start_token = torch.where(doc_change_tok, tok_idx, torch.zeros_like(tok_idx)).cummax(dim=0).values
+            doc_start_blk_ptr = torch.floor_divide(doc_start_token[t_rep_l], block_size).to(torch.int64)
+            block_start_tok = (q_blocks * int(block_size)).to(torch.long)
+            doc_start_blk_local = torch.floor_divide(doc_start_token[block_start_tok], block_size).to(torch.int64)
 
         if sb.pointer_qblock_rep == "last":
             delta_rep = delta_star[0, :, t_rep_l]
@@ -1735,47 +1803,127 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         teacher_mass = teacher_mass[:, :num_blocks, :]
         teacher_mass = teacher_mass.masked_fill(local_mask, 0.0)
         t_sum = teacher_mass.sum(dim=-1, keepdim=True)
-        t_norm = teacher_mass / (t_sum + 1.0e-9)
         valid = (t_sum.squeeze(-1) > 0)
-        cov = -(t_norm * torch.log(P + 1.0e-9)).sum(dim=-1)
-        cov = (cov * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        n_valid_q = int(valid.sum().item())
+        if n_valid_q <= 0:
+            teacher_stats_state.update(
+                teacher_ran=True,
+                teacher_skip_reason="no_valid_tokens",
+                n_valid_q=0,
+                n_valid_blocks=0,
+                n_pos=0,
+                n_neg=0,
+                teacher_target_entropy=0.0,
+                teacher_top1_mass=0.0,
+                step=int(step),
+            )
+            teacher_loss_state["loss"] = None
+            return None
 
+        t_norm = teacher_mass / (t_sum + 1.0e-9)
         valid_k = (kb_idx_i[None, None, :] >= doc_start_blk_local[None, :, None]) & (kb_idx_i[None, None, :] <= qb_idx)
         valid_k = valid_k & (~local_mask)
+        n_valid_blocks = int(valid_k.sum().item())
+        if n_valid_blocks <= 0:
+            teacher_stats_state.update(
+                teacher_ran=True,
+                teacher_skip_reason="no_valid_blocks",
+                n_valid_q=n_valid_q,
+                n_valid_blocks=0,
+                n_pos=0,
+                n_neg=0,
+                teacher_target_entropy=0.0,
+                teacher_top1_mass=0.0,
+                step=int(step),
+            )
+            teacher_loss_state["loss"] = None
+            return None
+
+        valid_denom = valid.float().sum().clamp_min(1.0)
+        t_norm_safe = t_norm.clamp_min(1.0e-9)
+        teacher_target_entropy = float((-(t_norm_safe * torch.log(t_norm_safe)).sum(dim=-1) * valid.float()).sum() / valid_denom)
+        teacher_top1_mass = float((t_norm.max(dim=-1).values * valid.float()).sum() / valid_denom)
+
+        cov = -(t_norm * torch.log(P + 1.0e-9)).sum(dim=-1)
+        cov = (cov * valid.float()).sum() / valid_denom
+
         expected = (P * valid_k.float()).sum(dim=-1)
         max_extra = max(num_blocks - local_blocks, 0)
         target_extra = float(min(budget_rem, max_extra))
         budget = (expected - target_extra).square()
-        budget = (budget * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        budget = (budget * valid.float()).sum() / valid_denom
 
-        nce = None
+        nce = torch.zeros((), device=device, dtype=torch.float32)
+        n_pos = 0
+        n_neg = 0
+        skip_reason = "not_time"
         if bool(args.spectral_teacher_nce):
-            pos_k = int(args.spectral_teacher_nce_pos)
-            neg_k = int(args.spectral_teacher_nce_neg)
-            pos_k = min(pos_k, num_blocks)
-            neg_k = min(neg_k, num_blocks)
-            if pos_k > 0 and neg_k > 0:
-                mass_for_topk = teacher_mass.masked_fill(~valid_k, -1.0e9)
-                pos_idx = torch.topk(mass_for_topk, k=pos_k, dim=-1).indices
-                gen = torch.Generator(device=device)
-                gen.manual_seed(int(args.seed) + 1000003 * int(step) + 917)
-                rand = torch.rand(mass_for_topk.shape, device=device, generator=gen)
-                rand = rand.masked_fill(~valid_k, -1.0)
-                neg_idx = torch.topk(rand, k=neg_k, dim=-1).indices
+            pos_k = min(int(args.spectral_teacher_nce_pos), num_blocks)
+            neg_k = min(int(args.spectral_teacher_nce_neg), num_blocks)
+            n_pos = max(pos_k, 0)
+            n_neg = max(neg_k, 0)
+            if pos_k <= 0:
+                skip_reason = "no_pos"
+            elif neg_k <= 0:
+                skip_reason = "no_neg"
+            else:
+                valid_k_q = valid_k.squeeze(0).sum(dim=-1)
+                nce_valid = valid & (valid_k_q[None, :] >= pos_k) & (valid_k_q[None, :] >= neg_k)
+                if int(nce_valid.sum().item()) <= 0:
+                    skip_reason = "no_neg"
+                else:
+                    mass_for_topk = teacher_mass.masked_fill(~valid_k, -1.0e9)
+                    pos_idx = torch.topk(mass_for_topk, k=pos_k, dim=-1).indices
+                    gen = torch.Generator(device=device)
+                    gen.manual_seed(int(args.seed) + 1000003 * int(step) + 917)
+                    rand = torch.rand(mass_for_topk.shape, device=device, generator=gen)
+                    rand = rand.masked_fill(~valid_k, -1.0)
+                    neg_idx = torch.topk(rand, k=neg_k, dim=-1).indices
 
-                P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
-                logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
-                pos_scores = logits.gather(2, pos_idx)
-                neg_scores = logits.gather(2, neg_idx)
-                neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
-                pos_scores_exp = pos_scores.unsqueeze(-1)
-                all_scores = torch.cat([pos_scores_exp, neg_scores], dim=-1)
-                denom = torch.logsumexp(all_scores, dim=-1)
-                nce = (denom - pos_scores)
-                nce = (nce * valid.float().unsqueeze(-1)).sum() / valid.float().sum().clamp_min(1.0)
+                    P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
+                    logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
+                    pos_scores = logits.gather(2, pos_idx)
+                    neg_scores = logits.gather(2, neg_idx)
+                    neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
+                    pos_scores_exp = pos_scores.unsqueeze(-1)
+                    all_scores = torch.cat([pos_scores_exp, neg_scores], dim=-1)
+                    denom = torch.logsumexp(all_scores, dim=-1)
+                    nce_val = (denom - pos_scores)
+                    nce = (nce_val * nce_valid.float().unsqueeze(-1)).sum() / (
+                        nce_valid.float().sum().clamp_min(1.0) * float(pos_k)
+                    )
+                    n_pos = pos_k
+                    n_neg = neg_k
+                    skip_reason = "not_time"
+        else:
+            skip_reason = "no_neg"
 
-        if nce is None:
-            nce = torch.zeros((), device=device, dtype=torch.float32)
+        if not (torch.isfinite(cov) and torch.isfinite(budget) and torch.isfinite(nce)):
+            teacher_stats_state.update(
+                teacher_ran=True,
+                teacher_skip_reason="nonfinite",
+                n_valid_q=n_valid_q,
+                n_valid_blocks=n_valid_blocks,
+                n_pos=n_pos,
+                n_neg=n_neg,
+                teacher_target_entropy=teacher_target_entropy,
+                teacher_top1_mass=teacher_top1_mass,
+                step=int(step),
+            )
+            teacher_loss_state["loss"] = None
+            return None
+
+        teacher_stats_state.update(
+            teacher_ran=True,
+            teacher_skip_reason=skip_reason,
+            n_valid_q=n_valid_q,
+            n_valid_blocks=n_valid_blocks,
+            n_pos=n_pos,
+            n_neg=n_neg,
+            teacher_target_entropy=teacher_target_entropy,
+            teacher_top1_mass=teacher_top1_mass,
+            step=int(step),
+        )
 
         loss = (
             float(args.spectral_teacher_lambda_cov) * cov
@@ -1788,6 +1936,20 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         teacher_loss_state["nce"] = float(nce.detach().item())
         teacher_loss_state["step"] = int(step)
         return loss
+    except Exception:
+        teacher_stats_state.update(
+            teacher_ran=True,
+            teacher_skip_reason="exception",
+            n_valid_q=0,
+            n_valid_blocks=0,
+            n_pos=0,
+            n_neg=0,
+            teacher_target_entropy=0.0,
+            teacher_top1_mass=0.0,
+            step=int(step),
+        )
+        teacher_loss_state["loss"] = None
+        return None
 
 def _parse_csv_ints(s: str) -> list[int]:
     parts = [p.strip() for p in str(s).split(",")]
