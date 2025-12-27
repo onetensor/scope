@@ -748,7 +748,7 @@ class Hyperparameters:
     spectral_teacher_nce_pos = 4
     spectral_teacher_nce_neg = 16
     spectral_teacher_lambda_nce = 0.1
-    spectral_pointer_schedule = True
+    spectral_pointer_schedule = False
     spectral_pointer_schedule_disable_steps = 300
     spectral_pointer_schedule_mid_steps = 1500
     spectral_pointer_schedule_half_blocks_mid = 2

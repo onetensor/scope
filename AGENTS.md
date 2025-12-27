@@ -37,7 +37,7 @@ Primary toggles used by `run_ablations.sh`:
 - `SPECTRAL_IMPL=qk_aug|score_mod`
 - `SPECTRAL_QK_AUG_ALIGN=16`
 - `SPECTRAL_USE_POINTER_MASK=0|1`
-- `SPECTRAL_POINTER_SCHEDULE=0|1`
+- `SPECTRAL_POINTER_SCHEDULE=0|1` (default: `0`)
 - `SPECTRAL_POINTER_LOCAL_BLOCKS=<int>`
 - `SPECTRAL_POINTER_HALF_BLOCKS=<int>`
 - `SPECTRAL_POINTER_BUDGET_BLOCKS=<int>` (π allocates this total pointer KV budget: local + centers + extra)
