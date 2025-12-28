@@ -715,9 +715,9 @@ class Hyperparameters:
     spectral_delta_star_max_schedule_min = -1  # <0 -> use spectral_L_train - 1
     spectral_delta_star_max_schedule_max = -1  # <0 -> use max(train,val) - 1
     spectral_use_pointer_mask = True
-    spectral_pointer_local_blocks = 12
+    spectral_pointer_local_blocks = 16
     spectral_pointer_half_blocks = 4
-    spectral_pointer_budget_blocks = 8  # total pointer KV budget (local + centers + extra) per head/qblock
+    spectral_pointer_budget_blocks = 64  # total pointer KV budget (local + centers + extra) per head/qblock
     spectral_pointer_budget_is_total = True
     spectral_pointer_budget_temp = 1.0
     spectral_pointer_radius_mode = "pi"  # "fixed" | "pi"
@@ -1395,6 +1395,45 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
     sbs = spectral_bias_modules
     sb0 = sbs[0]
 
+    # Derived pointer-budget telemetry (helps explain "knob changed but mask didn't").
+    budget_eff = None
+    try:
+        if bool(pointer_mask_state.get("enabled")):
+            m_peaks = int(getattr(sb0, "M", 0) or 0)
+            local_blocks = int(getattr(sb0, "pointer_local_blocks", 0) or 0)
+            half_max = int(getattr(sb0, "pointer_half_blocks", 0) or 0)
+            half_active = int(pointer_mask_state.get("half_blocks") or 0)
+            budget_cfg = int(getattr(sb0, "pointer_budget_blocks", 0) or 0)
+            budget_is_total = bool(getattr(sb0, "pointer_budget_is_total", True))
+
+            max_sum_radii_max = max(m_peaks, 0) * max(half_max, 0)
+            max_sum_radii_active = max(m_peaks, 0) * max(half_active, 0)
+            if budget_is_total:
+                total_cap = max(local_blocks, 0) + max(m_peaks, 0) + max_sum_radii_max
+                total_req = max(budget_cfg, 0)
+                total_clipped = min(total_req, total_cap)
+                rem_req = max(total_clipped - max(local_blocks, 0) - max(m_peaks, 0), 0)
+            else:
+                total_req = max(budget_cfg, 0)
+                total_cap = None
+                rem_req = min(total_req, max_sum_radii_max)
+            rem_active = min(rem_req, max_sum_radii_active)
+            budget_eff = dict(
+                peaks=int(m_peaks),
+                half_blocks_active=int(half_active),
+                max_sum_radii_active=int(max_sum_radii_active),
+                budget_cfg=int(budget_cfg),
+                budget_is_total=bool(budget_is_total),
+                total_req=(int(total_req) if total_req is not None else None),
+                total_cap=(int(total_cap) if total_cap is not None else None),
+                rem_req=int(rem_req),
+                rem_active=int(rem_active),
+                clipped_total=bool(total_cap is not None and total_req is not None and total_req > total_cap),
+                clipped_active=bool(rem_active < rem_req),
+            )
+    except Exception:
+        budget_eff = None
+
     kv_hist = sum((sb._dbg_kv_unique_hist for sb in sbs), start=torch.zeros_like(sb0._dbg_kv_unique_hist))
     kv_total = int(kv_hist.sum().item())
     if kv_total > 0:
@@ -1455,6 +1494,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         pointer_cfg=dict(
             local_blocks=int(sb0.pointer_local_blocks),
             half_blocks_max=int(sb0.pointer_half_blocks),
+            half_blocks_active=int(pointer_mask_state["half_blocks"]),
             budget_blocks=int(sb0.pointer_budget_blocks),
             budget_is_total=bool(sb0.pointer_budget_is_total),
             budget_temp=float(sb0.pointer_budget_temp),
@@ -1462,6 +1502,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             global_blocks_max=int(sb0.pointer_global_blocks),
             qblock_rep=str(sb0.pointer_qblock_rep),
             doc_clamp=bool(sb0.pointer_doc_clamp),
+            budget_effective=budget_eff,
             gumbel_topk=dict(
                 enabled=bool(sb0.gumbel_topk),
                 k=int(sb0.gumbel_topk_k),
@@ -1504,9 +1545,14 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
             step=int(teacher_loss_state.get("step") or 0),
         )
     if args.spectral_teacher:
+        every = int(args.spectral_teacher_every)
+        payload["teacher_every"] = every
+        payload["teacher_due"] = bool(every > 0 and (int(step) % every) == 0)
+        last_ran = teacher_stats_state.get("step")
+        payload["teacher_last_ran_step"] = (int(last_ran) if last_ran is not None else -1)
         payload["teacher_ran"] = bool(teacher_stats_state.get("teacher_ran"))
         payload["teacher_skip_reason"] = str(teacher_stats_state.get("teacher_skip_reason") or "not_time")
-        payload["n_valid_q"] = int(teacher_stats_state.get("n_valid_q") or 0)
+        payload["n_valid_q"] = int(teacher_stats_state.get("n_valid_q") or 0)   
         payload["n_valid_blocks"] = int(teacher_stats_state.get("n_valid_blocks") or 0)
         payload["n_pos"] = int(teacher_stats_state.get("n_pos") or 0)
         payload["n_neg"] = int(teacher_stats_state.get("n_neg") or 0)
@@ -1515,7 +1561,7 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         payload["teacher_nce_neg_used"] = int(teacher_stats_state.get("teacher_nce_neg_used") or 0)
         payload["teacher_target_entropy"] = float(teacher_stats_state.get("teacher_target_entropy") or 0.0)
         payload["teacher_top1_mass"] = float(teacher_stats_state.get("teacher_top1_mass") or 0.0)
-        payload["teacher_stats_step"] = int(teacher_stats_state.get("step") or 0)
+        payload["teacher_stats_step"] = payload["teacher_last_ran_step"]
     print0(json.dumps(payload), console=True)
 
 def _block_masks_for_teacher(model: nn.Module, input_seq: Tensor, docs: Tensor, window_blocks: Tensor):
@@ -1937,17 +1983,17 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
                             else:
                                 P_clamped = P.clamp(1.0e-6, 1.0 - 1.0e-6)
                                 logits = torch.log(P_clamped) - torch.log1p(-P_clamped)
-                                pos_scores = logits.gather(2, pos_idx)
-                                neg_scores = logits.gather(2, neg_idx)
+                                pos_scores = logits.gather(2, pos_idx)  # [Hh,QB,pos_k]
+                                neg_scores = logits.gather(2, neg_idx)  # [Hh,QB,neg_k]
                                 neg_scores = neg_scores.masked_fill(~neg_valid, -1.0e9)
                                 neg_scores = neg_scores.unsqueeze(-2).expand(-1, -1, pos_k, -1)
-                                pos_scores_exp = pos_scores.unsqueeze(-1)
-                                all_scores = torch.cat([pos_scores_exp, neg_scores], dim=-1)
-                                denom = torch.logsumexp(all_scores, dim=-1)
-                                nce_val = (denom - pos_scores)
-                                pos_mask = pos_valid & nce_valid.unsqueeze(-1)
-                                pos_mask_f = pos_mask.float()
-                                nce = (nce_val * pos_mask_f).sum() / pos_mask_f.sum().clamp_min(1.0)
+                                all_scores = torch.cat([pos_scores.unsqueeze(-1), neg_scores], dim=-1)
+                                denom = torch.logsumexp(all_scores, dim=-1)  # [Hh,QB,pos_k]
+                                loss_pos = (denom - pos_scores)  # [Hh,QB,pos_k]
+                                loss_pos = loss_pos.masked_fill(~pos_valid, 0.0)
+                                pos_count_f = pos_count.to(dtype=torch.float32).clamp_min(1.0)
+                                loss_hq = loss_pos.sum(dim=-1) / pos_count_f  # [Hh,QB]
+                                nce = loss_hq.masked_fill(~nce_valid, 0.0).sum() / nce_valid.float().sum().clamp_min(1.0)
                                 n_pos = int(pos_k)
                                 n_neg = int(neg_k)
                                 nce_used = True
@@ -2069,7 +2115,18 @@ def maybe_run_needle_eval(*, step: int, window_blocks: Tensor, force: bool = Fal
         return
 
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-    vocab_high = int(args.vocab_size - 1)  # exclude EOD token id 50256 from random tokens
+    eod_token_id = 50256
+    vocab_size = int(args.vocab_size)
+    if not (0 <= eod_token_id < vocab_size):
+        raise ValueError(f"EOD token id {eod_token_id} out of range for vocab_size={vocab_size}")
+
+    # Sample tokens from the vocab while excluding EOD (to avoid accidental doc boundaries).
+    vocab_no_eod = vocab_size - 1
+    def _rand_no_eod(shape: tuple[int, ...], *, generator: torch.Generator) -> Tensor:
+        t = torch.randint(0, vocab_no_eod, shape, device=device, dtype=torch.int32, generator=generator)
+        if eod_token_id != vocab_size - 1:
+            t = t + (t >= eod_token_id).to(dtype=t.dtype)
+        return t
 
     results: dict[int, dict[str, float]] = {}
     total_loss = 0.0
@@ -2093,9 +2150,9 @@ def maybe_run_needle_eval(*, step: int, window_blocks: Tensor, force: bool = Fal
                 gen = torch.Generator(device=device)
                 gen.manual_seed(int(args.seed) + 1000003 * int(step) + 1009 * dist_tokens + si)
 
-                full = torch.randint(0, vocab_high, (seq_len + 1,), device=device, dtype=torch.int32, generator=gen)
-                anchor = torch.randint(0, vocab_high, (anchor_len,), device=device, dtype=torch.int32, generator=gen)
-                value = torch.randint(0, vocab_high, (value_len,), device=device, dtype=torch.int32, generator=gen)
+                full = _rand_no_eod((seq_len + 1,), generator=gen)
+                anchor = _rand_no_eod((anchor_len,), generator=gen)
+                value = _rand_no_eod((value_len,), generator=gen)
 
                 full[needle_start : needle_start + anchor_len] = anchor
                 full[needle_start + anchor_len : needle_start + anchor_len + value_len] = value
@@ -2427,7 +2484,8 @@ for step in range(train_steps + 1):
     window_blocks = get_window_size_blocks(step)
     def _train_fwd_bwd():
         loss = model(inputs, targets, window_blocks)
-        teacher_loss = compute_teacher_loss(step=step, inputs=inputs, window_blocks=window_blocks)
+        # Teacher schedule uses the same 1-based "global step" convention as `SCOPE_STATS`.
+        teacher_loss = compute_teacher_loss(step=step + 1, inputs=inputs, window_blocks=window_blocks)
         if teacher_loss is not None:
             loss = loss + teacher_loss
         loss.backward()
