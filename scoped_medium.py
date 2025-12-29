@@ -692,7 +692,7 @@ class Hyperparameters:
     spectral_impl = "qk_aug"  # "qk_aug" (no score_mod) | "score_mod"
     spectral_qk_aug_align = 16  # pad augmented head dim up to a multiple of this (e.g. 8/16) for kernel friendliness
     spectral_K = 6
-    spectral_M = 2
+    spectral_M = 8
     spectral_beta = 0.5
     spectral_L_train = 4096
     spectral_L_max = 1_000_000
@@ -715,11 +715,11 @@ class Hyperparameters:
     spectral_delta_star_max_schedule_min = -1  # <0 -> use spectral_L_train - 1
     spectral_delta_star_max_schedule_max = -1  # <0 -> use max(train,val) - 1
     spectral_use_pointer_mask = True
-    spectral_pointer_local_blocks = 16
+    spectral_pointer_local_blocks = 8
     spectral_pointer_half_blocks = 4
     spectral_pointer_budget_blocks = 64  # total pointer KV budget (local + centers + extra) per head/qblock
     spectral_pointer_budget_is_total = True
-    spectral_pointer_budget_temp = 1.0
+    spectral_pointer_budget_temp = 0.5
     spectral_pointer_radius_mode = "pi"  # "fixed" | "pi"
     # Global anchors are a training stability aid but can cause "block0 collapse" if left on.
     # Default: warmup with 2 blocks, then drop to 0 so pointers must learn nontrivial retrieval.
@@ -1307,6 +1307,8 @@ teacher_stats_state = dict(
     teacher_target_entropy=0.0,
     teacher_top1_mass=0.0,
     step=None,
+    call_count=0,
+    last_call_step=None,
 )
 def maybe_update_gumbel_seed(step: int):
     if not spectral_bias_modules:
@@ -1408,28 +1410,44 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
 
             max_sum_radii_max = max(m_peaks, 0) * max(half_max, 0)
             max_sum_radii_active = max(m_peaks, 0) * max(half_active, 0)
+            max_extra_blocks_max = 2 * max_sum_radii_max
+            local_blocks = max(local_blocks, 0)
+            m_peaks = max(m_peaks, 0)
+            total_cap_blocks = local_blocks + m_peaks + max_extra_blocks_max
+
             if budget_is_total:
-                total_cap = max(local_blocks, 0) + max(m_peaks, 0) + max_sum_radii_max
-                total_req = max(budget_cfg, 0)
-                total_clipped = min(total_req, total_cap)
-                rem_req = max(total_clipped - max(local_blocks, 0) - max(m_peaks, 0), 0)
+                total_req_blocks = max(budget_cfg, 0)
+                total_clipped_blocks = min(total_req_blocks, total_cap_blocks)
+                extra_req_blocks = max(total_clipped_blocks - local_blocks - m_peaks, 0)
+                clipped_total = bool(total_req_blocks > total_cap_blocks)
             else:
-                total_req = max(budget_cfg, 0)
-                total_cap = None
-                rem_req = min(total_req, max_sum_radii_max)
-            rem_active = min(rem_req, max_sum_radii_active)
+                # Compatibility mode: interpret cfg as extra blocks (outside local+centers).
+                extra_req_blocks = min(max(budget_cfg, 0), max_extra_blocks_max)
+                total_req_blocks = local_blocks + m_peaks + max(budget_cfg, 0)
+                total_clipped_blocks = local_blocks + m_peaks + extra_req_blocks
+                clipped_total = bool(max(budget_cfg, 0) > max_extra_blocks_max)
+
+            extra_req_radii = int(extra_req_blocks) // 2
+            extra_active_radii = min(extra_req_radii, max_sum_radii_active)
+            extra_active_blocks = int(2 * extra_active_radii)
+            total_active_blocks = int(local_blocks + m_peaks + extra_active_blocks)
+            clipped_active = bool(extra_active_radii < extra_req_radii)
             budget_eff = dict(
                 peaks=int(m_peaks),
+                half_blocks_max=int(half_max),
                 half_blocks_active=int(half_active),
-                max_sum_radii_active=int(max_sum_radii_active),
-                budget_cfg=int(budget_cfg),
+                budget_cfg_blocks=int(budget_cfg),
                 budget_is_total=bool(budget_is_total),
-                total_req=(int(total_req) if total_req is not None else None),
-                total_cap=(int(total_cap) if total_cap is not None else None),
-                rem_req=int(rem_req),
-                rem_active=int(rem_active),
-                clipped_total=bool(total_cap is not None and total_req is not None and total_req > total_cap),
-                clipped_active=bool(rem_active < rem_req),
+                total_req_blocks=int(total_req_blocks),
+                total_cap_blocks=int(total_cap_blocks),
+                total_clipped_blocks=int(total_clipped_blocks),
+                extra_req_blocks=int(extra_req_blocks),
+                extra_req_radii=int(extra_req_radii),
+                extra_active_radii=int(extra_active_radii),
+                extra_active_blocks=int(extra_active_blocks),
+                total_active_blocks=int(total_active_blocks),
+                clipped_total=bool(clipped_total),
+                clipped_active=bool(clipped_active),
             )
     except Exception:
         budget_eff = None
@@ -1548,6 +1566,9 @@ def log_scope_stats(*, step: int, train_loss: Tensor | None = None, sliding_wind
         every = int(args.spectral_teacher_every)
         payload["teacher_every"] = every
         payload["teacher_due"] = bool(every > 0 and (int(step) % every) == 0)
+        payload["teacher_call_count"] = int(teacher_stats_state.get("call_count") or 0)
+        last_call = teacher_stats_state.get("last_call_step")
+        payload["teacher_last_call_step"] = (int(last_call) if last_call is not None else -1)
         last_ran = teacher_stats_state.get("step")
         payload["teacher_last_ran_step"] = (int(last_ran) if last_ran is not None else -1)
         payload["teacher_ran"] = bool(teacher_stats_state.get("teacher_ran"))
@@ -1597,10 +1618,11 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
     if not args.spectral_teacher:
         return None
     every = int(args.spectral_teacher_every)
+    teacher_stats_state["call_count"] = int(teacher_stats_state.get("call_count") or 0) + 1
+    teacher_stats_state["last_call_step"] = int(step)
     if every <= 0 or (step % every) != 0:
-        if teacher_stats_state.get("step") is None:
-            teacher_stats_state.update(
-                teacher_ran=False,
+        teacher_stats_state.update(
+            teacher_ran=False,
             teacher_skip_reason="not_time",
             n_valid_q=0,
             n_valid_blocks=0,
@@ -1611,7 +1633,6 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
             teacher_nce_neg_used=0,
             teacher_target_entropy=0.0,
             teacher_top1_mass=0.0,
-            step=None,
         )
         return None
     if not spectral_bias_modules or not args.spectral_use_pointer_mask:
@@ -1825,13 +1846,19 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         local_blocks = min(int(sb.pointer_local_blocks), num_blocks)
         ptr_half_active = int(sb._pointer_half_blocks_active.item())
 
-        budget_val = int(sb.pointer_budget_blocks)
+        budget_val = max(0, int(sb.pointer_budget_blocks))
+        ptr_half_cap = max(ptr_half_active, 0)
         if sb.pointer_budget_is_total:
-            budget_total = min(budget_val, int(local_blocks + M + (M * int(sb.pointer_half_blocks))))
-            budget_rem = max(budget_total - int(local_blocks) - int(M), 0)
+            budget_total_req = budget_val
+            budget_total_cap = int(local_blocks + M + (2 * M * ptr_half_cap))
+            budget_total = min(int(budget_total_req), int(budget_total_cap))
+            budget_extra_blocks = max(int(budget_total) - int(local_blocks) - int(M), 0)
+            budget_target_nonlocal_blocks = max(int(budget_total) - int(local_blocks), 0)
         else:
-            budget_rem = budget_val
-        budget_rem = min(int(budget_rem), int(M * max(ptr_half_active, 0)))
+            budget_extra_blocks = budget_val
+            budget_total = int(local_blocks + M + budget_extra_blocks)
+            budget_target_nonlocal_blocks = max(int(M + budget_extra_blocks), 0)
+        budget_rem = min(int(budget_extra_blocks) // 2, int(M * ptr_half_cap))
         if budget_rem <= 0:
             r_m = delta_rep.new_zeros(delta_rep.shape)
         else:
@@ -1921,7 +1948,7 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
 
         expected = (P * valid_k.float()).sum(dim=-1)
         max_extra = max(num_blocks - local_blocks, 0)
-        target_extra = float(min(budget_rem, max_extra))
+        target_extra = float(min(int(budget_target_nonlocal_blocks), int(max_extra)))
         budget = (expected - target_extra).square()
         budget = (budget * valid.float()).sum() / valid_denom
 
@@ -2064,6 +2091,8 @@ def compute_teacher_loss(*, step: int, inputs: Tensor, window_blocks: Tensor) ->
         )
         teacher_loss_state["loss"] = None
         return None
+
+compute_teacher_loss_nocompile = _dynamo.disable(compute_teacher_loss) if _dynamo is not None else compute_teacher_loss
 
 def _parse_csv_ints(s: str) -> list[int]:
     parts = [p.strip() for p in str(s).split(",")]
@@ -2485,7 +2514,7 @@ for step in range(train_steps + 1):
     def _train_fwd_bwd():
         loss = model(inputs, targets, window_blocks)
         # Teacher schedule uses the same 1-based "global step" convention as `SCOPE_STATS`.
-        teacher_loss = compute_teacher_loss(step=step + 1, inputs=inputs, window_blocks=window_blocks)
+        teacher_loss = compute_teacher_loss_nocompile(step=step + 1, inputs=inputs, window_blocks=window_blocks)
         if teacher_loss is not None:
             loss = loss + teacher_loss
         loss.backward()

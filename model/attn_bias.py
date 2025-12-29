@@ -720,15 +720,17 @@ class SpectralBias(nn.Module):
 
         if self.pointer_radius_mode == "fixed":
             r_m = ptr_half_active.view(1, 1, 1).expand(H, num_blocks, M)  # [H,QB,M]
-            r_m = torch.where(ptr_enabled.bool(), r_m, torch.zeros_like(r_m))
         else:
             budget_val = self.pointer_budget_blocks if pointer_budget_blocks is None else int(pointer_budget_blocks)
             budget_val = max(0, int(budget_val))
             if self.pointer_budget_is_total:
-                budget_total = min(budget_val, int(local_blocks + M + (M * int(ptr_half_blocks))))
-                budget_rem = max(budget_total - int(local_blocks) - int(M), 0)
+                budget_total_req = int(budget_val)
+                budget_total_cap = int(local_blocks + M + (2 * M * int(ptr_half_blocks)))
+                budget_total = min(budget_total_req, budget_total_cap)
+                budget_extra_blocks = max(budget_total - int(local_blocks) - int(M), 0)
             else:
-                budget_rem = budget_val
+                budget_extra_blocks = int(budget_val)
+            budget_rem = int(budget_extra_blocks) // 2
             budget_rem = min(int(budget_rem), int(M * int(ptr_half_blocks)))
             if budget_rem <= 0:
                 r_m = delta_rep.new_zeros(delta_rep.shape, dtype=torch.int32)  # [H,QB,M]
@@ -754,8 +756,9 @@ class SpectralBias(nn.Module):
                 add = (rank < rem_int[..., None]).to(floor.dtype)
                 extra = floor + add
                 r_m = torch.clamp(extra.to(torch.int32), min=0, max=int(ptr_half_blocks))
-            r_m = torch.minimum(r_m, ptr_half_active)  # respect schedule cap
-            r_m = torch.where(ptr_enabled.bool(), r_m, torch.zeros_like(r_m))
+
+        r_m = torch.minimum(r_m, ptr_half_active)  # respect schedule cap
+        r_m = torch.where(ptr_enabled.bool(), r_m, torch.zeros_like(r_m))
 
         if self.training and self.gumbel_topk and ptr_half_blocks > 0:
             k = int(self.gumbel_topk_k)
