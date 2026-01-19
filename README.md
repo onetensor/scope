@@ -8,7 +8,6 @@ The goal is to preserve short-range quality while enabling â€œlibrary retrievalâ
 
 - `scoped_medium.py`: primary training script (model + data + optimizer + training loop).
 - `baseline.py`: frozen snapshot of the original baseline (kept unmodified for ablations).
-- `SPEC.md`: the full SCOPE project specification.
 - `model/attn_bias.py`: `SpectralBias` module + pointer-driven `BlockMask` builder + SCOPE telemetry buffers.
 - `run_ablations.sh`: runs the 3-run ablation set (A/B/C).
 - `Dockerfile`: CUDA container; built/pushed via `.github/workflows/ghcr.yml`.
