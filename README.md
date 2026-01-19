@@ -1,6 +1,6 @@
 # SCOPE: Spectral COntext Pointer Encoding (Long-Context Selective Attention)
 
-This repo is a research codebase for **SCOPE**: adding a *query-conditioned, band-limited spectral bias* to attention logits, plus a *pointer-driven block-sparse KV mask* so the model can learn long-range selection and still run efficiently at **128k–1M** context.
+This repo is a research codebase for **SCOPE**: adding a query-conditioned, band-limited spectral bias to attention logits, plus a pointer-driven block-sparse KV mask so the model can learn long-range selection and still run efficiently at **128k–1M** context.
 
 The goal is to preserve short-range quality while enabling “library retrieval”: for each query, concentrate attention on a few predicted offsets (and suppress most of the rest) without ever materializing dense `[T,T]` bias matrices.
 
@@ -11,7 +11,7 @@ The goal is to preserve short-range quality while enabling “library retrieval�
 - `SPEC.md`: the full SCOPE project specification.
 - `model/attn_bias.py`: `SpectralBias` module + pointer-driven `BlockMask` builder + SCOPE telemetry buffers.
 - `run_ablations.sh`: runs the 3-run ablation set (A/B/C).
-- `Dockerfile`: CUDA container used on Vast.ai; built/pushed via `.github/workflows/ghcr.yml`.
+- `Dockerfile`: CUDA container; built/pushed via `.github/workflows/ghcr.yml`.
 
 ## What We Implemented So Far
 
@@ -122,16 +122,9 @@ You can force pointer masking during validation:
 - `FLEXATTN_COMPILE=0|1` (compile FlexAttention standalone when graph-broken; keeps fused kernel)
 - `LOG_ALL_RANKS=0|1` (write one logfile per rank)
 
-## Docker / Vast.ai
+## Docker 
 
 The GH Actions workflow in `.github/workflows/ghcr.yml` builds and pushes:
 
 - `ghcr.io/<org>/<repo>:latest`
 - `ghcr.io/<org>/<repo>:<sha>`
-
-On Vast.ai, run the container and launch `torchrun` inside it.
-
-## Known Issues
-
-- **FlexAttention + Inductor**: some PyTorch nightlies fail compiling `flex_attention_backward` when using nontrivial score modifications (assertion in Inductor lowering). If you hit an error like `assert len(idx) == len(output_size)` during `flex_attention_backward`, it’s likely an upstream compiler issue. Pinning to a different nightly (or newer build) is the usual fix.
-
