@@ -12,7 +12,7 @@ The goal is to preserve short-range quality while enabling â€œlibrary retrievalâ
 - `run_ablations.sh`: runs the 3-run ablation set (A/B/C).
 - `Dockerfile`: CUDA container; built/pushed via `.github/workflows/ghcr.yml`.
 
-## What We Implemented So Far
+## What has been Implemented So Far
 
 - Spectral bias via FlexAttention without dense bias matrices.
 - Pointer-driven block-sparse KV selection (union of):
