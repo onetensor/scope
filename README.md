@@ -1,6 +1,6 @@
 # SCOPE: Spectral COntext Pointer Encoding (Long-Context Selective Attention)
 
-This repo is a research codebase for **SCOPE**: adding a query-conditioned, band-limited spectral bias to attention logits, plus a pointer-driven block-sparse KV mask so the model can learn long-range selection and still run efficiently at **128k–1M** context.
+This repo is a research codebase for SCOPE: adding a query-conditioned, band-limited spectral bias to attention logits, plus a pointer-driven block-sparse KV mask so the model can learn long-range selection and still run efficiently at 128k–1M context.
 
 The goal is to preserve short-range quality while enabling “library retrieval”: for each query, concentrate attention on a few predicted offsets (and suppress most of the rest) without ever materializing dense `[T,T]` bias matrices.
 
@@ -14,13 +14,13 @@ The goal is to preserve short-range quality while enabling “library retrieval�
 
 ## What We Implemented So Far
 
-- **Spectral bias via FlexAttention** without dense bias matrices.
-- **Pointer-driven block-sparse KV selection** (union of):
+- Spectral bias via FlexAttention without dense bias matrices.
+- Pointer-driven block-sparse KV selection (union of):
   - local sliding window (stability)
   - pointer windows around predicted `Δ*` (learn long-range access)
   - optional global anchor blocks
-- **Fixed-shape KV lists** using an “active radius via duplication” trick to avoid compile thrash.
-- **Rank-0 telemetry** (`SCOPE_BINS` + `SCOPE_STATS`) to measure KV budget, pointer behavior, and regularizer magnitudes.
+- Fixed-shape KV lists using an “active radius via duplication” trick to avoid compile thrash.
+- Rank-0 telemetry (`SCOPE_BINS` + `SCOPE_STATS`) to measure KV budget, pointer behavior, and regularizer magnitudes.
 
 ## Running
 
@@ -48,9 +48,9 @@ Useful overrides:
 
 Runs:
 
-- **A**: baseline (spectral disabled)
-- **B**: bias-only (spectral enabled, pointer mask OFF)
-- **C**: bias + pointer mask (spectral enabled, pointer mask ON + schedule)
+- A: baseline (spectral disabled)
+- B: bias-only (spectral enabled, pointer mask OFF)
+- C: bias + pointer mask (spectral enabled, pointer mask ON + schedule)
 
 ```bash
 ./run_ablations.sh
